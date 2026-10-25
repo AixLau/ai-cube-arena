@@ -11,13 +11,13 @@ export function rotateCubeTool(limits: RunLimits): ToolSpec {
     description:
       `Rotate faces of the 3x3x3 cube. Executes the given moves in order and returns the new cube state. ` +
       `Allowed moves: R L U D F B (90° clockwise looking at that face), with ' for counter-clockwise and 2 for 180°. ` +
-      `1 to ${limits.maxMovesPerCall} moves per call. If any move is invalid, the whole call is rejected and nothing is executed.`,
+      `Any number of moves may be supplied in one call. If any move is invalid, the whole call is rejected and nothing is executed.`,
     parameters: {
       type: 'object',
       properties: {
         moves: {
           type: 'array',
-          description: `Moves to execute in order, e.g. ["R", "U'", "F2"]. At most ${limits.maxMovesPerCall}.`,
+          description: `Moves to execute in order, e.g. ["R", "U'", "F2"].`,
           items: { type: 'string', enum: ALL_MOVES },
         },
       },
@@ -41,9 +41,9 @@ export function systemPrompt(limits: RunLimits, n: number = 3): string {
   return `你正在参加「AI 魔方能力评测」。你的任务：仅通过调用 rotate_cube 工具，把一个被打乱的${name}魔方（${n}×${n}×${n}）复原。
 
 【评测规则】
-- 你只能通过 rotate_cube 工具转动魔方；每次调用 1～${limits.maxMovesPerCall} 步，系统按顺序执行后返回新状态。
+- 你只能通过 rotate_cube 工具转动魔方；系统按顺序执行你提供的动作后返回新状态。
 - 只要包含一个非法记号，整次调用会被拒绝且不执行任何转动。
-- 限制：总转动次数不限，但 API 调用不超过 ${limits.maxApiCalls} 次，总时长不超过 ${limits.maxDurationSec} 秒。
+- 评测不会因思考时间、调用次数或动作数量自动终止；魔方复原后立即结束。
 - 魔方复原（每个面颜色一致）的瞬间评测立即结束，无需再回复。用尽量少的步数复原。
 
 【坐标与配色】

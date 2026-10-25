@@ -57,7 +57,6 @@ function credentialLimiter(host: string, apiKey: string | undefined, limit: numb
   return sem;
 }
 
-const REQUEST_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 180_000);
 /** 网络错误、超时、5xx 的重试次数（计入 API 调用预算） */
 const MAX_RETRIES = 2;
 /** 限流（429）的重试次数（不计入预算，但受最大运行时间约束） */
@@ -199,13 +198,6 @@ export class Contestant {
     if (this.abort.signal.aborted) throw new StopSignal();
   }
 
-  private limitReached(): string | null {
-    const { limits } = this.run;
-    if (this.stats.apiCalls >= limits.maxApiCalls) return `达到最大 API 调用次数（${limits.maxApiCalls}）`;
-    if (this.elapsed() >= limits.maxDurationSec * 1000) return `达到最大运行时间（${limits.maxDurationSec} 秒）`;
-    return null;
-  }
-
   private addUsage(u: { input: number | null; output: number | null; reasoning: number | null; cost: number | null } | null) {
     const s = this.stats;
     if (!u || u.input === null || u.output === null) s.usageMissingCalls++;
@@ -304,14 +296,9 @@ export class Contestant {
     // 不把上一轮的 assistant/tool 历史带回供应商；当前状态是完整事实来源。
     let turns: Turn[] = [this.stateTurn()];
     const limiter = credentialLimiter(hostOf(endpoint), apiKey, this.config.maxConcurrentRequests);
-    let noToolStreak = 0;
-
     try {
       for (;;) {
         await this.checkpoint();
-        const limit = this.limitReached();
-        if (limit) return this.setStatus('failed', limit);
-
         let result;
         let attempt = 0;
         for (;;) {
@@ -322,14 +309,13 @@ export class Contestant {
             this.clockStart();
             if (!ok) throw new StopSignal();
           }
-          const remainingMs = limits.maxDurationSec * 1000 - this.elapsed();
           this.stats.apiCalls++;
           const started = Date.now();
           try {
             result = await adapter.call({
               config: this.config, model: this.model, reasoningEffort: this.effort,
               endpoint, apiKey, system, tools, turns,
-              toolChoice: 'auto', signal: this.abort.signal, timeoutMs: Math.max(1000, Math.min(REQUEST_TIMEOUT_MS, remainingMs)),
+              toolChoice: 'auto', signal: this.abort.signal, timeoutMs: null,
             });
             this.stats.lastLatencyMs = Date.now() - started;
             this.stats.apiLatencyMs += this.stats.lastLatencyMs;
@@ -339,6 +325,7 @@ export class Contestant {
             this.stats.apiLatencyMs += this.stats.lastLatencyMs;
             if (this.abort.signal.aborted) throw new StopSignal();
             const err = e instanceof ProviderError ? e : new ProviderError('network', '请求失败');
+            this.recordCall('', [], null, err.message);
             // 模型不支持推理强度参数：去掉该参数重试一次，并明确记录（不计入预算）
             if (this.effort !== 'default' && err.status === 400 && EFFORT_REJECT_RE.test(err.message)) {
               this.stats.apiCalls--;
@@ -359,16 +346,14 @@ export class Contestant {
             }
             this.emitStats();
             const maxAttempts = throttled ? MAX_THROTTLE_RETRIES : MAX_RETRIES;
-            if ((throttled || transient) && attempt < maxAttempts && !this.limitReached()) {
+            if ((throttled || transient) && attempt < maxAttempts) {
               attempt++;
               const backoff = Math.min(30_000, 2000 * 2 ** (attempt - 1)) * (0.75 + Math.random() * 0.5);
               const delay = Math.round(err.retryAfterMs ?? backoff);
-              if (this.elapsed() + delay < limits.maxDurationSec * 1000) {
-                this.log('warn', `${err.message}，${(delay / 1000).toFixed(1)} 秒后重试（第 ${attempt}/${maxAttempts} 次）`);
-                await new Promise((r) => setTimeout(r, delay));
-                await this.checkpoint();
-                continue;
-              }
+              this.log('warn', `${err.message}，${(delay / 1000).toFixed(1)} 秒后重试（第 ${attempt}/${maxAttempts} 次）`);
+              await new Promise((r) => setTimeout(r, delay));
+              await this.checkpoint();
+              continue;
             }
             throw err;
           } finally {
@@ -379,26 +364,22 @@ export class Contestant {
 
         this.addUsage(result.usage);
         if (!result.toolCalls.length) {
-          noToolStreak++;
-          this.recordCall(result.text, []);
+          this.recordCall(result.text, [], result.usage);
           this.emitStats();
-          if (noToolStreak >= 3) return this.setStatus('failed', '模型连续 3 次未调用 rotate_cube');
           turns = [this.stateTurn(NO_TOOL_NUDGE)];
           continue;
         }
-        noToolStreak = 0;
-
         const summaries: { moves: string[]; ok: boolean; error?: string }[] = [];
         for (const call of result.toolCalls) {
           this.stats.toolCalls++;
           // 必须回复每一个工具调用；复原后或达到上限时，剩余调用不再执行
-          const blocked = isSolved(this.state) ? '魔方已复原，未执行' : this.limitReached();
+          const blocked = isSolved(this.state) ? '魔方已复原，未执行' : null;
           const r = blocked
             ? { content: JSON.stringify({ ok: false, error: blocked, executed: [] }), moves: [], ok: false, error: blocked }
             : await this.executeTool(call);
           summaries.push({ moves: r.moves, ok: r.ok, error: r.error });
         }
-        this.recordCall(result.text, summaries);
+        this.recordCall(result.text, summaries, result.usage);
         this.emitStats();
         if (isSolved(this.state)) return this.setStatus('solved');
 
@@ -415,14 +396,22 @@ export class Contestant {
     }
   }
 
-  private recordCall(text: string, tools: { moves: string[]; ok: boolean; error?: string }[]) {
+  private recordCall(
+    text: string,
+    tools: { moves: string[]; ok: boolean; error?: string }[],
+    usage: { input: number | null; output: number | null; reasoning: number | null } | null,
+    error?: string,
+  ) {
     const item = {
       t: this.now(),
       type: 'call' as const,
       n: this.stats.apiCalls,
       latencyMs: this.stats.lastLatencyMs ?? 0,
-      text: text.slice(0, 600),
+      text: text.slice(0, 2000),
       tools,
+      usage: usage ? { input: usage.input, output: usage.output, reasoning: usage.reasoning } : undefined,
+      outcome: error ? 'error' as const : 'success' as const,
+      error,
     };
     this.trace.push(item);
     this.run.emit({ type: 'call', cid: this.info.id, item });
@@ -452,7 +441,7 @@ export class Run {
     // 服务端只打乱一次，所有选手共享同一个（不可变的）初始状态
     this.scramble = randomScramble(difficulty.scrambleLength, Math.random, cubeSize);
     this.initialState = Object.freeze(this.scramble.reduce(applyMove, solvedState(cubeSize))) as CubeState;
-    this.slots = new Semaphore(limits.concurrency);
+    this.slots = new Semaphore(Number.POSITIVE_INFINITY);
     this.contestants = entries.map((e) => new Contestant(this, e));
     this.emit({ type: 'init', run: this.summary() });
   }

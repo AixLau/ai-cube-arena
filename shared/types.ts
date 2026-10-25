@@ -216,7 +216,17 @@ export interface ContestantState {
 
 export type TraceItem =
   | { t: number; type: 'move'; move: string; index: number }
-  | { t: number; type: 'call'; n: number; latencyMs: number; text: string; tools: { moves: string[]; ok: boolean; error?: string }[] }
+  | {
+      t: number;
+      type: 'call';
+      n: number;
+      latencyMs: number;
+      text: string;
+      tools: { moves: string[]; ok: boolean; error?: string }[];
+      usage?: { input: number | null; output: number | null; reasoning: number | null };
+      outcome?: 'success' | 'error';
+      error?: string;
+    }
   | { t: number; type: 'status'; status: ContestantStatus; reason?: string }
   | { t: number; type: 'log'; level: 'info' | 'warn' | 'error'; text: string };
 

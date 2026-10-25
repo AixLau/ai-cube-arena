@@ -51,7 +51,8 @@ export interface CallContext {
   turns: Turn[];
   toolChoice: 'auto' | 'required';
   signal: AbortSignal;
-  timeoutMs: number;
+  /** null 表示不限制单次请求时长，由手动停止控制 */
+  timeoutMs: number | null;
 }
 
 export interface ProtocolAdapter {

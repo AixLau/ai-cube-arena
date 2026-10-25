@@ -268,14 +268,14 @@ test('多模型同题评测：同一初始状态、独立状态、真正并发�
   mock.delayMs = 0;
 });
 
-test('并发上限：concurrency=1 时依次运行，单个模型可停止且不影响其它', async () => {
+test('移除统一并发限制后，单个模型可停止且不影响其它', async () => {
   const configs = [await createConfig(draft({ name: 'a' })), await createConfig(draft({ name: 'b' }))];
   mock.delayMs = 200;
   const run = new Run(configs.map((c) => E(c)), DIFFICULTIES[0], { ...DEFAULT_LIMITS, concurrency: 1 });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
   const done = run.start();
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(run.contestants[1].status, 'queued');
+  assert.equal(run.contestants[1].status, 'running');
   run.contestants[0].stop();
   await done;
   assert.equal(run.contestants[0].status, 'stopped');

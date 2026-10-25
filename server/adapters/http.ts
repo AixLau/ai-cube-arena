@@ -52,7 +52,7 @@ export function upstreamMessage(json: unknown, text: string): string {
 
 interface PostOptions {
   signal: AbortSignal;
-  timeoutMs: number;
+  timeoutMs: number | null;
   secrets: (string | undefined)[];
 }
 
@@ -76,7 +76,7 @@ async function requestJson(
   } catch (e) {
     throw new ProviderError('url', e instanceof UrlPolicyError ? e.message : 'API 地址无效');
   }
-  const timeout = AbortSignal.timeout(timeoutMs);
+  const timeout = timeoutMs != null && Number.isFinite(timeoutMs) && timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : null;
   const started = Date.now();
   let res;
   try {
@@ -85,12 +85,12 @@ async function requestJson(
       headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), Accept: 'application/json', ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: 'manual',
-      signal: AbortSignal.any([signal, timeout]),
+      signal: timeout ? AbortSignal.any([signal, timeout]) : signal,
       dispatcher: safeDispatcher,
     });
   } catch (e) {
     if (signal.aborted) throw new ProviderError('aborted', '请求已取消');
-    if (timeout.aborted) throw new ProviderError('timeout', `请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
+    if (timeout?.aborted) throw new ProviderError('timeout', `请求超时（${Math.round(timeoutMs! / 1000)} 秒）`);
     const cause = (e as { cause?: NodeJS.ErrnoException }).cause;
     const code = cause?.code ?? '';
     const map: Record<string, string> = {
@@ -119,7 +119,7 @@ async function requestJson(
   if (reader) {
     for (;;) {
       const { done, value } = await reader.read().catch((e) => {
-        if (timeout.aborted) throw new ProviderError('timeout', `请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
+        if (timeout?.aborted) throw new ProviderError('timeout', `请求超时（${Math.round(timeoutMs! / 1000)} 秒）`);
         if (signal.aborted) throw new ProviderError('aborted', '请求已取消');
         throw new ProviderError('network', '读取响应失败', res.status, redact(String(e?.message ?? ''), secrets));
       });
