@@ -14,8 +14,18 @@ function toInput(turns: Turn[]) {
         } else if (it.type === 'message') {
           const text = (it.content ?? []).map((c: any) => c.text ?? '').join('');
           if (text) items.push({ role: 'assistant', content: text });
-        } else if (it.type === 'reasoning' && it.encrypted_content) {
-          items.push({ type: 'reasoning', summary: it.summary ?? [], encrypted_content: it.encrypted_content });
+        } else if (it.type === 'reasoning') {
+          // Reasoning summaries are safe to replay. Encrypted content lets supported
+          // reasoning models continue the previous turn without exposing hidden CoT.
+          const summary = Array.isArray(it.summary) ? it.summary : [];
+          if (it.encrypted_content || summary.length) {
+            items.push({
+              type: 'reasoning',
+              ...(typeof it.id === 'string' ? { id: it.id } : {}),
+              summary,
+              ...(it.encrypted_content ? { encrypted_content: it.encrypted_content } : {}),
+            });
+          }
         }
       }
     } else {
@@ -25,9 +35,20 @@ function toInput(turns: Turn[]) {
   return items;
 }
 
+const reasoningSummaryUnsupported = new Set<string>();
+const encryptedReasoningUnsupported = new Set<string>();
+
+function optionalReasoningOption(error: unknown, option: 'summary' | 'encrypted'): boolean {
+  if (!(error instanceof ProviderError) || error.status !== 400) return false;
+  const message = error.message;
+  if (option === 'summary') return /summary|reasoning/i.test(message);
+  return /include|encrypted_content|reasoning/i.test(message);
+}
+
 export const openaiResponsesAdapter: ProtocolAdapter = {
   async call(ctx) {
     const { config } = ctx;
+    const modelKey = `${ctx.endpoint}\0${ctx.model}`;
     const body: Record<string, unknown> = {
       model: ctx.model,
       instructions: ctx.system,
@@ -38,14 +59,45 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
       body.tools = ctx.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }));
       body.tool_choice = ctx.toolChoice;
     }
-    if (ctx.reasoningEffort !== 'default') body.reasoning = { effort: ctx.reasoningEffort };
+    if (!reasoningSummaryUnsupported.has(modelKey)) {
+      body.reasoning = {
+        ...(ctx.reasoningEffort !== 'default' ? { effort: ctx.reasoningEffort } : {}),
+        summary: 'concise',
+      };
+    } else if (ctx.reasoningEffort !== 'default') {
+      body.reasoning = { effort: ctx.reasoningEffort };
+    }
+    if (!encryptedReasoningUnsupported.has(modelKey)) body.include = ['reasoning.encrypted_content'];
     if (ctx.maxOutputTokens) body.max_output_tokens = ctx.maxOutputTokens;
 
-    const { json } = await postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), body, {
+    const send = () => postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), body, {
       signal: ctx.signal,
       timeoutMs: ctx.timeoutMs,
       secrets: [ctx.apiKey],
     });
+    let json: any;
+    for (;;) {
+      try {
+        ({ json } = await send());
+        break;
+      } catch (e) {
+        // Older OpenAI-compatible relays reject the optional reasoning fields. Retry
+        // once with only the core request and remember the capability per endpoint/model.
+        if (body.include && optionalReasoningOption(e, 'encrypted')) {
+          encryptedReasoningUnsupported.add(modelKey);
+          delete body.include;
+          continue;
+        }
+        if (body.reasoning && (body.reasoning as Record<string, unknown>).summary && optionalReasoningOption(e, 'summary')) {
+          reasoningSummaryUnsupported.add(modelKey);
+          const { summary: _summary, ...reasoning } = body.reasoning as Record<string, unknown>;
+          if (Object.keys(reasoning).length) body.reasoning = reasoning;
+          else delete body.reasoning;
+          continue;
+        }
+        throw e;
+      }
+    }
     if (!Array.isArray(json?.output)) throw new ProviderError('parse', '响应中缺少 output 数组（该地址可能不支持 Responses API）');
     const toolCalls: ToolCall[] = [];
     let text = '';
