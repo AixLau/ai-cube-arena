@@ -82,7 +82,7 @@ async function requestJson(
   try {
     res = await fetch(url, {
       method,
-      headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), Accept: 'application/json', ...headers },
+      headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), Accept: 'application/json', ...headers, 'User-Agent': 'Codex cli' },
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: 'manual',
       signal: timeout ? AbortSignal.any([signal, timeout]) : signal,
