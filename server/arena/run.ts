@@ -310,6 +310,8 @@ export class Contestant {
             if (!ok) throw new StopSignal();
           }
           this.stats.apiCalls++;
+          // 请求发出前立即同步计数，前端可在模型思考期间显示当前调用次数。
+          this.emitStats();
           const started = Date.now();
           try {
             result = await adapter.call({
