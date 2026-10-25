@@ -1,0 +1,39 @@
+{
+  "name": "ai-cube-arena",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c blue,cyan \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:web": "vite",
+    "build": "tsc -p tsconfig.json && vite build",
+    "start": "NODE_ENV=production tsx server/index.ts",
+    "test": "tsx --test shared/*.test.ts server/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "postinstall": "patch-package"
+  },
+  "dependencies": {
+    "cubing": "^0.66.1",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.4",
+    "three": "^0.170.0",
+    "tsx": "^4.23.15",
+    "undici": "^8.12.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/three": "^0.170.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
+    "patch-package": "^8.0.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="魔方智竞：连接你偏好的 AI 模型，在同一块魔方上对比不同模型的推理策略。" />
+    <title>魔方智竞 · AI 多模型魔方竞技平台</title>
+    <script>
+      // 在首帧渲染前应用主题，避免深色模式闪白
+      (function () {
+        var t = null;
+        try { t = localStorage.getItem('cube-arena-theme'); } catch (e) {}
+        if (t !== 'light' && t !== 'dark') t = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        document.documentElement.dataset.theme = t;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
