@@ -1,5 +1,5 @@
 import { authHeaders, postJson, ProviderError } from './http.ts';
-import { parseArgs, reportedCost, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
+import { parseArgs, reportedCost, splitThinkTags, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
 
 /** OpenAI 兼容 Chat Completions（tools / tool_calls / role=tool） */
 function toMessages(system: string, turns: Turn[]) {
@@ -20,6 +20,12 @@ function toMessages(system: string, turns: Turn[]) {
   return messages;
 }
 
+/**
+ * OpenAI 的 o 系列 / gpt-5 等推理模型拒绝 max_tokens，只接受 max_completion_tokens；
+ * 多数兼容接口则只认 max_tokens。默认发送 max_tokens，被点名拒绝后改用新字段并按 端点 + 模型 记住。
+ */
+const completionTokensModels = new Set<string>();
+
 export const openaiChatAdapter: ProtocolAdapter = {
   async call(ctx) {
     const { config } = ctx;
@@ -33,12 +39,20 @@ export const openaiChatAdapter: ProtocolAdapter = {
       body.tool_choice = ctx.toolChoice;
     }
     if (ctx.reasoningEffort !== 'default') body.reasoning_effort = ctx.reasoningEffort;
+    const modelKey = `${ctx.endpoint}\0${ctx.model}`;
+    if (ctx.maxOutputTokens) body[completionTokensModels.has(modelKey) ? 'max_completion_tokens' : 'max_tokens'] = ctx.maxOutputTokens;
 
-    const { json } = await postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), body, {
-      signal: ctx.signal,
-      timeoutMs: ctx.timeoutMs,
-      secrets: [ctx.apiKey],
-    });
+    const send = (b: Record<string, unknown>) =>
+      postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), b, { signal: ctx.signal, timeoutMs: ctx.timeoutMs, secrets: [ctx.apiKey] });
+    let json;
+    try {
+      ({ json } = await send(body));
+    } catch (e) {
+      if (!(e instanceof ProviderError) || e.status !== 400 || body.max_tokens === undefined || !/max_completion_tokens/.test(e.message)) throw e;
+      completionTokensModels.add(modelKey);
+      const { max_tokens, ...rest } = body;
+      ({ json } = await send({ ...rest, max_completion_tokens: max_tokens }));
+    }
     const choice = json?.choices?.[0];
     if (!choice?.message) throw new ProviderError('parse', '响应中缺少 choices[0].message');
     const message = choice.message;
@@ -56,12 +70,17 @@ export const openaiChatAdapter: ProtocolAdapter = {
         ? message.tool_calls.map((c: any, i: number) => ({ ...c, id: toolCalls[i]?.id ?? c.id, type: c.type ?? 'function' }))
         : undefined,
     };
+    // 思考字段：DeepSeek / Kimi / Qwen 等用 reasoning_content，OpenRouter / Ollama 等用 reasoning；也可能以 <think> 写在正文
+    const own = [message.reasoning_content, message.reasoning].find((v) => typeof v === 'string' && v.trim()) ?? '';
+    const split = splitThinkTags(typeof message.content === 'string' ? message.content : '');
     const u = json.usage;
     return {
-      text: typeof message.content === 'string' ? message.content : '',
+      text: split.text,
+      reasoning: [own, split.reasoning].filter(Boolean).join('\n\n'),
       toolCalls,
       raw,
       finishReason: choice.finish_reason ?? null,
+      truncated: choice.finish_reason === 'length',
       usage: u
         ? {
             input: usageNum(u.prompt_tokens),

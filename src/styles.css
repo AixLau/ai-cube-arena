@@ -358,6 +358,7 @@ input[type='range'] { width: 100%; accent-color: var(--blue); }
 .chip.last { background: linear-gradient(135deg, var(--aqua), var(--cobalt)); color: #fff; border-color: transparent; }
 .chip.last i { color: var(--s80); }
 .chip.bad { color: var(--err); text-decoration: line-through; }
+.chip.warn { color: var(--warn); }
 .empty { color: var(--ink-3); font-size: 13px; padding: 6px 0; }
 
 .log { display: flex; flex-direction: column; gap: 10px; max-height: 340px; overflow: auto; }
@@ -608,6 +609,7 @@ input[type='text'], input:not([type]), input[type='password'], input[type='url']
 .trace-item.error { border-left: 3px solid var(--err); }
 .trace-item.status { color: var(--ink-2); }
 .trace-text { display: block; color: var(--ink-2); font-size: 12px; margin-top: 2px; white-space: pre-wrap; }
+.trace-think summary { cursor: pointer; color: var(--ink-3); font-size: 12px; margin-top: 2px; }
 .contestant.replay .ct-stage { height: 280px; }
 .contestant-grid.n1 .contestant.replay .ct-stage { height: 440px; }
 

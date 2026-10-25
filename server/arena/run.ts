@@ -10,10 +10,10 @@ import {
 } from '../../shared/types.ts';
 import { ADAPTERS } from '../adapters/index.ts';
 import { ProviderError } from '../adapters/http.ts';
-import type { ToolCall, Turn } from '../adapters/types.ts';
 import { getApiKey } from '../providers/store.ts';
+import type { ToolCall, Turn, TurnResult } from '../adapters/types.ts';
 import { redact } from '../security/redact.ts';
-import { describeState, initialUserMessage, NO_TOOL_NUDGE, rotateCubeTool, systemPrompt } from './prompt.ts';
+import { describeState, initialUserMessage, NO_TOOL_NUDGE, rotateCubeTool, systemPrompt, TRUNCATED_NOTE } from './prompt.ts';
 import { saveRun } from './store.ts';
 
 /** 简单的计数信号量，用于单局并发与全局并发控制 */
@@ -61,13 +61,38 @@ function credentialLimiter(host: string, apiKey: string | undefined, limit: numb
 const MAX_RETRIES = 2;
 /** 限流（429）的重试次数（不计入预算，但受最大运行时间约束） */
 const MAX_THROTTLE_RETRIES = 8;
-/** 推理强度参数被拒绝时，上游错误信息通常会提到这些字段 */
-const EFFORT_REJECT_RE = /reasoning|effort|thinking|budget|unrecognized|unknown (field|param)|unsupported|not support|extra (fields|inputs)/i;
+const EFFORT_PARAM_RE = /reasoning|effort|thinking|budget/i;
+const TOOL_CHOICE_PARAM_RE = /tool_choice|tool choice|function_?calling_?config|functionCallingConfig/i;
+const GENERIC_REJECT_RE = /unrecognized|unknown (field|param)|unsupported|not support|extra (fields|inputs)/i;
+/** 错误信息点名了这些字段时，泛化的「不支持」不归因到可选参数 */
+const OTHER_PARAM_RE = /max_(completion_|output_)?tokens|maxOutputTokens|\btools?\b|functionDeclarations/i;
+
+/**
+ * 400 错误是否在拒绝某个可选参数：按错误信息点名的字段判断，
+ * 避免把 max_tokens、tools 等其它字段的拒绝误判为推理强度不受支持。
+ */
+function rejectedOptionalParam(err: ProviderError, sent: { effort: boolean; forcedTool: boolean }): 'effort' | 'toolChoice' | null {
+  if (err.status !== 400) return null;
+  const m = err.message;
+  const generic = GENERIC_REJECT_RE.test(m) && !OTHER_PARAM_RE.test(m);
+  if (sent.forcedTool && (TOOL_CHOICE_PARAM_RE.test(m) || (generic && !EFFORT_PARAM_RE.test(m)))) return 'toolChoice';
+  if (sent.effort && (EFFORT_PARAM_RE.test(m) || generic)) return 'effort';
+  return null;
+}
+
+/** 思考内容可能很长：保留开头与结尾（结论通常在末尾），控制事件与记录体积 */
+const MAX_TRACE_REASONING = 4000;
+function clipMiddle(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const head = Math.floor(max / 4);
+  return `${s.slice(0, head)}\n…（省略 ${s.length - max} 字）…\n${s.slice(s.length - (max - head))}`;
+}
 
 export interface ContestantEntry {
   config: ProviderConfig;
   model: string;
   reasoningEffort: ReasoningEffort;
+  maxOutputTokens?: number | null;
 }
 
 const emptyStats = (state: CubeState): ContestantStats => ({
@@ -94,6 +119,7 @@ export class Contestant {
 
   private readonly config: ProviderConfig;
   private readonly model: string;
+  private readonly maxOutputTokens: number | null;
   /** 推理强度；被模型拒绝后降级为 default 继续 */
   private effort: ReasoningEffort;
 
@@ -104,6 +130,7 @@ export class Contestant {
     this.config = entry.config;
     this.model = entry.model;
     this.effort = entry.reasoningEffort;
+    this.maxOutputTokens = entry.maxOutputTokens ?? null;
     this.state = run.initialState;
     this.stats = emptyStats(this.state);
     const endpoint = resolveEndpoint(this.config.protocol, this.config.baseUrl, this.model);
@@ -295,6 +322,9 @@ export class Contestant {
     const system = systemPrompt(limits, this.run.cubeSize);
     // 不把上一轮的 assistant/tool 历史带回供应商；当前状态是完整事实来源。
     let turns: Turn[] = [this.stateTurn()];
+    // 上一轮没有调用工具时，下一次请求要求必须调用工具；供应商不支持时整局回退为 auto
+    let forceTool = false;
+    let canForceTool = true;
     const limiter = credentialLimiter(hostOf(endpoint), apiKey, this.config.maxConcurrentRequests);
     try {
       for (;;) {
@@ -313,11 +343,12 @@ export class Contestant {
           // 请求发出前立即同步计数，前端可在模型思考期间显示当前调用次数。
           this.emitStats();
           const started = Date.now();
+          const toolChoice = forceTool && canForceTool ? 'required' : 'auto';
           try {
             result = await adapter.call({
-              config: this.config, model: this.model, reasoningEffort: this.effort,
+              config: this.config, model: this.model, reasoningEffort: this.effort, maxOutputTokens: this.maxOutputTokens,
               endpoint, apiKey, system, tools, turns,
-              toolChoice: 'auto', signal: this.abort.signal, timeoutMs: null,
+              toolChoice, signal: this.abort.signal, timeoutMs: null,
             });
             this.stats.lastLatencyMs = Date.now() - started;
             this.stats.apiLatencyMs += this.stats.lastLatencyMs;
@@ -327,13 +358,19 @@ export class Contestant {
             this.stats.apiLatencyMs += this.stats.lastLatencyMs;
             if (this.abort.signal.aborted) throw new StopSignal();
             const err = e instanceof ProviderError ? e : new ProviderError('network', '请求失败');
-            this.recordCall('', [], null, err.message);
-            // 模型不支持推理强度参数：去掉该参数重试一次，并明确记录（不计入预算）
-            if (this.effort !== 'default' && err.status === 400 && EFFORT_REJECT_RE.test(err.message)) {
+            this.recordCall(null, [], err.message);
+            // 模型不支持某个可选参数：去掉该参数重试，并明确记录（不计入预算）
+            const rejected = rejectedOptionalParam(err, { effort: this.effort !== 'default', forcedTool: toolChoice === 'required' });
+            if (rejected) {
               this.stats.apiCalls--;
-              this.stats.effortIgnored = true;
-              this.log('warn', `该模型不接受推理强度参数（${err.message}），已改为默认推理强度继续`);
-              this.effort = 'default';
+              if (rejected === 'effort') {
+                this.stats.effortIgnored = true;
+                this.log('warn', `该模型不接受推理强度参数（${err.message}），已改为默认推理强度继续`);
+                this.effort = 'default';
+              } else {
+                canForceTool = false;
+                this.log('warn', `该模型不支持强制工具调用（${err.message}），之后只使用 tool_choice=auto`);
+              }
               continue;
             }
             const throttled = err.status === 429;
@@ -365,12 +402,18 @@ export class Contestant {
         }
 
         this.addUsage(result.usage);
+        if (result.truncated) {
+          this.log('warn', `第 ${this.stats.apiCalls} 次调用的输出达到最大输出 Token 上限被截断${result.toolCalls.length ? '' : '，没有形成工具调用'}`);
+        }
+
         if (!result.toolCalls.length) {
-          this.recordCall(result.text, [], result.usage);
+          this.recordCall(result, []);
           this.emitStats();
-          turns = [this.stateTurn(NO_TOOL_NUDGE)];
+          forceTool = true;
+          turns = [this.stateTurn(result.truncated ? `${TRUNCATED_NOTE}\n${NO_TOOL_NUDGE}` : NO_TOOL_NUDGE)];
           continue;
         }
+        forceTool = false;
         const summaries: { moves: string[]; ok: boolean; error?: string }[] = [];
         for (const call of result.toolCalls) {
           this.stats.toolCalls++;
@@ -381,7 +424,7 @@ export class Contestant {
             : await this.executeTool(call);
           summaries.push({ moves: r.moves, ok: r.ok, error: r.error });
         }
-        this.recordCall(result.text, summaries, result.usage);
+        this.recordCall(result, summaries);
         this.emitStats();
         if (isSolved(this.state)) return this.setStatus('solved');
 
@@ -389,7 +432,7 @@ export class Contestant {
           if (s.ok) return `已执行：${s.moves.join(' ') || '无'}`;
           return `工具调用未执行：${s.error ?? '未知错误'}`;
         }).join('\n');
-        turns = [this.stateTurn(`上一轮工具执行摘要：\n${feedback}\n请继续调用 rotate_cube。`)];
+        turns = [this.stateTurn(`上一轮工具执行摘要：\n${feedback}${result.truncated ? `\n${TRUNCATED_NOTE}` : ''}\n请继续调用 rotate_cube。`)];
       }
     } catch (e) {
       if (e instanceof StopSignal || this.abort.signal.aborted) return this.setStatus('stopped', this.failReason ?? '已手动停止');
@@ -398,18 +441,17 @@ export class Contestant {
     }
   }
 
-  private recordCall(
-    text: string,
-    tools: { moves: string[]; ok: boolean; error?: string }[],
-    usage: { input: number | null; output: number | null; reasoning: number | null } | null,
-    error?: string,
-  ) {
+  /** result 为 null 表示请求失败 */
+  private recordCall(result: TurnResult | null, tools: { moves: string[]; ok: boolean; error?: string }[], error?: string) {
+    const usage = result?.usage;
     const item = {
       t: this.now(),
       type: 'call' as const,
       n: this.stats.apiCalls,
       latencyMs: this.stats.lastLatencyMs ?? 0,
-      text: text.slice(0, 2000),
+      text: result?.text.slice(0, 2000) ?? '',
+      reasoning: result?.reasoning ? clipMiddle(result.reasoning, MAX_TRACE_REASONING) : undefined,
+      truncated: result?.truncated || undefined,
       tools,
       usage: usage ? { input: usage.input, output: usage.output, reasoning: usage.reasoning } : undefined,
       outcome: error ? 'error' as const : 'success' as const,

@@ -29,12 +29,13 @@ export const anthropicAdapter: ProtocolAdapter = {
       model: ctx.model,
       system: ctx.system,
       messages: toMessages(ctx.turns),
-      max_tokens: 8192,
+      max_tokens: ctx.maxOutputTokens ?? 8192,
     };
     if (ctx.reasoningEffort !== 'default') {
+      // Anthropic 要求 max_tokens 大于思考预算：输出上限叠加在预算之上
       const budget = THINKING_BUDGET[ctx.reasoningEffort];
       body.thinking = { type: 'enabled', budget_tokens: budget };
-      body.max_tokens = budget + 8192;
+      body.max_tokens = budget + (ctx.maxOutputTokens ?? 8192);
     }
     if (ctx.tools.length) {
       body.tools = ctx.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }));
@@ -51,11 +52,14 @@ export const anthropicAdapter: ProtocolAdapter = {
     if (!Array.isArray(json?.content)) throw new ProviderError('parse', '响应中缺少 content 数组（该地址可能不是 Anthropic 协议）');
     const toolCalls: ToolCall[] = [];
     let text = '';
+    const thoughts: string[] = [];
     for (const b of json.content) {
       if (b.type === 'tool_use') {
         const ok = b.input && typeof b.input === 'object' && !Array.isArray(b.input);
         toolCalls.push({ id: String(b.id), name: String(b.name), args: ok ? b.input : null, argsError: ok ? undefined : '工具参数不是 JSON 对象' });
       } else if (b.type === 'text') text += b.text ?? '';
+      // redacted_thinking 只有密文，不展示
+      else if (b.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.trim()) thoughts.push(b.thinking.trim());
     }
     const u = json.usage;
     const input = u
@@ -66,9 +70,11 @@ export const anthropicAdapter: ProtocolAdapter = {
       : null;
     return {
       text,
+      reasoning: thoughts.join('\n\n'),
       toolCalls,
       raw: json.content,
       finishReason: json.stop_reason ?? null,
+      truncated: json.stop_reason === 'max_tokens',
       // Anthropic 的 output_tokens 已包含思考 Token，且不单独给出，推理 Token 记为未知
       usage: u ? { input, output: usageNum(u.output_tokens), reasoning: null, cost: reportedCost(u) } : null,
     };

@@ -158,7 +158,14 @@ export default function RunDetailPage() {
                     {t.tools.map((x, j) => (
                       <span key={j} className={`chip${x.ok ? '' : ' bad'}`} title={x.error}>{x.ok ? x.moves.join(' ') || '（空）' : `拒绝：${x.error}`}</span>
                     ))}
+                    {t.truncated && <span className="chip warn">输出被截断</span>}
                     {t.text && <span className="trace-text">{t.text}</span>}
+                    {t.reasoning && (
+                      <details className="trace-think">
+                        <summary>思考过程</summary>
+                        <span className="trace-text">{t.reasoning}</span>
+                      </details>
+                    )}
                   </span>
                 )}
                 {t.type === 'status' && <span>状态：{STATUS_TEXT[t.status]}{t.reason ? ` · ${t.reason}` : ''}</span>}

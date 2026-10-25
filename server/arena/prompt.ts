@@ -77,3 +77,5 @@ export function initialUserMessage(state: CubeState): string {
 }
 
 export const NO_TOOL_NUDGE = '请通过调用 rotate_cube 工具继续转动魔方，不要只回复文字。';
+
+export const TRUNCATED_NOTE = '注意：上一轮输出达到最大输出 Token 上限被截断。请缩短思考和文字说明，尽早调用 rotate_cube。';

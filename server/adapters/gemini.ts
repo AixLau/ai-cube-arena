@@ -37,9 +37,11 @@ export const geminiAdapter: ProtocolAdapter = {
       body.tools = [{ functionDeclarations: ctx.tools }];
       body.toolConfig = { functionCallingConfig: { mode: ctx.toolChoice === 'required' ? 'ANY' : 'AUTO' } };
     }
-    if (ctx.reasoningEffort !== 'default') {
-      body.generationConfig = { thinkingConfig: { thinkingBudget: THINKING_BUDGET[ctx.reasoningEffort] } };
-    }
+    const gen: Record<string, unknown> = {};
+    // includeThoughts 让响应带回思考摘要（thought: true 的 part），用于「思维过程」展示
+    if (ctx.reasoningEffort !== 'default') gen.thinkingConfig = { thinkingBudget: THINKING_BUDGET[ctx.reasoningEffort], includeThoughts: true };
+    if (ctx.maxOutputTokens) gen.maxOutputTokens = ctx.maxOutputTokens;
+    if (Object.keys(gen).length) body.generationConfig = gen;
 
     const { json } = await postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), body, {
       signal: ctx.signal,
@@ -54,6 +56,7 @@ export const geminiAdapter: ProtocolAdapter = {
     const parts: any[] = cand.content?.parts ?? [];
     const toolCalls: ToolCall[] = [];
     let text = '';
+    const thoughtTexts: string[] = [];
     parts.forEach((p, i) => {
       if (p.functionCall) {
         const args = p.functionCall.args;
@@ -64,16 +67,21 @@ export const geminiAdapter: ProtocolAdapter = {
           args: ok ? (args ?? {}) : null,
           argsError: ok ? undefined : '工具参数不是 JSON 对象',
         });
-      } else if (typeof p.text === 'string' && !p.thought) text += p.text;
+      } else if (typeof p.text === 'string') {
+        if (!p.thought) text += p.text;
+        else if (p.text.trim()) thoughtTexts.push(p.text.trim());
+      }
     });
     const u = json.usageMetadata;
     const candidates = usageNum(u?.candidatesTokenCount);
     const thoughts = usageNum(u?.thoughtsTokenCount);
     return {
       text,
+      reasoning: thoughtTexts.join('\n\n'),
       toolCalls,
       raw: parts,
       finishReason: cand.finishReason ?? null,
+      truncated: cand.finishReason === 'MAX_TOKENS',
       // Gemini 的思考 Token 单独计数且按输出计费：输出 = candidates + thoughts，推理 = thoughts
       usage: u
         ? {

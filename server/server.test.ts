@@ -81,6 +81,23 @@ const server = http.createServer((req, res) => {
       if (body.tools) return json(400, { error: { message: 'tools is not supported by this model' } });
       return json(200, { choices: [{ message: { role: 'assistant', content: 'ok' } }] });
     }
+    // maxtok：模拟 OpenAI 推理模型拒绝 max_tokens
+    if (url.startsWith('/maxtok/') && body.max_tokens !== undefined) {
+      return json(400, { error: { message: "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead." } });
+    }
+    if (url.startsWith('/nochoice/') && body.tool_choice === 'required') {
+      return json(400, { error: { message: "tool_choice 'required' is not supported by this model" } });
+    }
+    // chatty / nochoice：第一次请求只回复文字（chatty 的输出还被截断），思考写在 reasoning_content 与 <think> 中
+    if ((url.startsWith('/chatty/') || url.startsWith('/nochoice/')) && mock.calls.filter((c) => c.path === url).length === 1) {
+      return json(200, {
+        choices: [{
+          finish_reason: url.startsWith('/chatty/') ? 'length' : 'stop',
+          message: { role: 'assistant', content: '<think>先看 U 面</think>我来分析一下', reasoning_content: '观察展开图' },
+        }],
+        usage: { prompt_tokens: 100, completion_tokens: 50 },
+      });
+    }
     if (url.endsWith('/chat/completions')) {
       const wantsTool = Array.isArray(body.tools);
       const isPing = body.tools?.[0]?.function?.name === 'ping';
@@ -106,7 +123,10 @@ const server = http.createServer((req, res) => {
     if (url.endsWith('/responses')) {
       return json(200, {
         status: 'completed',
-        output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'rotate_cube', arguments: JSON.stringify({ moves }) }],
+        output: [
+          { type: 'reasoning', id: 'rs_1', summary: [{ type: 'summary_text', text: '推理摘要' }] },
+          { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'rotate_cube', arguments: JSON.stringify({ moves }) },
+        ],
         usage: { input_tokens: 80, output_tokens: 30, output_tokens_details: { reasoning_tokens: 5 } },
       });
     }
@@ -114,13 +134,20 @@ const server = http.createServer((req, res) => {
       assert.equal(req.headers['anthropic-version'], '2023-06-01');
       return json(200, {
         stop_reason: 'tool_use',
-        content: [{ type: 'text', text: '开始复原' }, { type: 'tool_use', id: 'tu_1', name: 'rotate_cube', input: { moves } }],
+        content: [
+          { type: 'thinking', thinking: '先还原底层', signature: 'sig' },
+          { type: 'text', text: '开始复原' },
+          { type: 'tool_use', id: 'tu_1', name: 'rotate_cube', input: { moves } },
+        ],
         usage: { input_tokens: 70, cache_read_input_tokens: 10, output_tokens: 40 },
       });
     }
     if (url.includes(':generateContent')) {
       return json(200, {
-        candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: [{ functionCall: { name: 'rotate_cube', args: { moves } }, thoughtSignature: 'sig' }] } }],
+        candidates: [{
+          finishReason: 'STOP',
+          content: { role: 'model', parts: [{ text: '思考摘要', thought: true }, { functionCall: { name: 'rotate_cube', args: { moves } }, thoughtSignature: 'sig' }] },
+        }],
         usageMetadata: { promptTokenCount: 60, candidatesTokenCount: 20, thoughtsTokenCount: 15 },
       });
     }
@@ -180,6 +207,9 @@ const draft = (over: Record<string, unknown>) => ({
   name: 'mock', protocol: 'openai-chat', baseUrl: `${base}/v1`, authMode: 'bearer', apiKey: 'sk-test-1234567890abcdef',
   ...over,
 }) as any;
+// 测试用的短打乱：模拟供应商一次性给出全部解法，需在单次步数上限内
+const D3 = { id: 'custom', name: '3', scrambleLength: 3 };
+const D6 = { id: 'custom', name: '6', scrambleLength: 6 };
 const E = (config: any, reasoningEffort: any = 'default', model = 'mock-model') => ({ config, model, reasoningEffort });
 
 test('配置存储：密钥默认只在内存，接口不回传，环境预置复制不带密钥', async () => {
@@ -220,7 +250,7 @@ test('多模型同题评测：同一初始状态、独立状态、真正并发�
   ];
   mock.calls = [];
   mock.delayMs = 300;
-  const run = new Run(configs.map((c) => E(c)), DIFFICULTIES[1], { ...DEFAULT_LIMITS, concurrency: 8 });
+  const run = new Run(configs.map((c) => E(c)), D6, { ...DEFAULT_LIMITS, concurrency: 8 });
   const scramble = formatAlg(run.scramble);
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
   const started = Date.now();
@@ -251,6 +281,15 @@ test('多模型同题评测：同一初始状态、独立状态、真正并发�
   assert.equal(byName.nousage.stats.inputTokens, null);
   assert.equal(byName.nousage.stats.cost, null);
 
+  // 思考内容：各协议的思考字段都提取到调用记录，正文不混入思考
+  const firstCall = (name: string) => run.contestants.find((c) => c.info.name === name)!.trace.find((t) => t.type === 'call') as any;
+  assert.equal(firstCall('chat').reasoning, 'thinking…');
+  assert.equal(firstCall('responses').reasoning, '推理摘要');
+  assert.equal(firstCall('anthropic').reasoning, '先还原底层');
+  assert.equal(firstCall('anthropic').text, '开始复原');
+  assert.equal(firstCall('gemini').reasoning, '思考摘要');
+  assert.equal(firstCall('gemini').text, '');
+
   // 模型拿不到打乱公式；所有模型收到相同的系统提示与初始状态
   const first = mock.calls.filter((c) => c.path.endsWith('/chat/completions') && c.body.tools?.[0]?.function?.name === 'rotate_cube');
   const sys = new Set(first.map((c) => c.body.messages[0].content));
@@ -271,7 +310,7 @@ test('多模型同题评测：同一初始状态、独立状态、真正并发�
 test('移除统一并发限制后，单个模型可停止且不影响其它', async () => {
   const configs = [await createConfig(draft({ name: 'a' })), await createConfig(draft({ name: 'b' }))];
   mock.delayMs = 200;
-  const run = new Run(configs.map((c) => E(c)), DIFFICULTIES[0], { ...DEFAULT_LIMITS, concurrency: 1 });
+  const run = new Run(configs.map((c) => E(c)), D3, { ...DEFAULT_LIMITS, concurrency: 1 });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
   const done = run.start();
   await new Promise((r) => setTimeout(r, 50));
@@ -292,7 +331,7 @@ test('限流：429 按 Retry-After 重试且不计入调用预算；同一密钥
   mock.delayMs = 150;
   maxInFlight = 0;
   throttleLeft = 2;
-  const run = new Run([...configs, throttled].map((c) => E(c)), DIFFICULTIES[0], { ...DEFAULT_LIMITS, concurrency: 8 });
+  const run = new Run([...configs, throttled].map((c) => E(c)), D3, { ...DEFAULT_LIMITS, concurrency: 8 });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
   await run.start();
   for (const c of run.contestants) assert.equal(c.status, 'solved', c.info.name);
@@ -306,7 +345,7 @@ test('限流：429 按 Retry-After 重试且不计入调用预算；同一密钥
 
 test('不限制总旋转次数：超过 200 步后仍可继续并复原', async () => {
   const cfg = await createConfig(draft({ name: 'spin', baseUrl: `${base}/spin/v1` }));
-  const run = new Run([E(cfg)], DIFFICULTIES[1], { ...DEFAULT_LIMITS, maxApiCalls: 40, concurrency: 1 });
+  const run = new Run([E(cfg)], D6, { ...DEFAULT_LIMITS, maxApiCalls: 40, concurrency: 1 });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
   await run.start();
   const c = run.contestants[0].snapshot();
@@ -331,7 +370,7 @@ test('推理强度：按协议发送参数；模型拒绝时去掉参数重试�
   const ok = await createConfig(draft({ name: 'effort' }));
   const rejecting = await createConfig(draft({ name: 'noeffort', baseUrl: `${base}/noeffort/v1` }));
   mock.calls = [];
-  const run = new Run([E(ok, 'high'), E(rejecting, 'low'), E(ok, 'default', 'mock-2')], DIFFICULTIES[0], { ...DEFAULT_LIMITS, concurrency: 4 });
+  const run = new Run([E(ok, 'high'), E(rejecting, 'low'), E(ok, 'default', 'mock-2')], D3, { ...DEFAULT_LIMITS, concurrency: 4 });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
   await run.start();
   for (const c of run.contestants) assert.equal(c.status, 'solved');
@@ -347,7 +386,7 @@ test('多阶魔方：4 阶与 2 阶同题评测，提示词说明阶数，初始
   const cfg = await createConfig(draft({ name: 'nxn' }));
   for (const n of [2, 4]) {
     mock.calls = [];
-    const run = new Run([E(cfg)], DIFFICULTIES[1], { ...DEFAULT_LIMITS, concurrency: 1 }, n);
+    const run = new Run([E(cfg)], D6, { ...DEFAULT_LIMITS, concurrency: 1 }, n);
     mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
     await run.start();
     assert.equal(run.contestants[0].status, 'solved', `${n} 阶`);
@@ -355,6 +394,60 @@ test('多阶魔方：4 阶与 2 阶同题评测，提示词说明阶数，初始
     assert.equal(run.summary().initialState.length, 6 * n * n);
     assert.match(mock.calls[0].body.messages[0].content, new RegExp(`${n}×${n}×${n}`));
   }
+});
+
+test('参数兼容：max_tokens 被拒绝时改用 max_completion_tokens，不误判为推理强度不受支持', async () => {
+  const cfg = await createConfig(draft({ name: 'maxtok', baseUrl: `${base}/maxtok/v1` }));
+  mock.calls = [];
+  const run = new Run([{ ...E(cfg, 'high'), maxOutputTokens: 512 }], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  const c = run.contestants[0].snapshot();
+  assert.equal(c.status, 'solved');
+  assert.ok(!c.stats.effortIgnored, '推理强度不应被去掉');
+  assert.equal(c.stats.apiCalls, 1, '字段改写后的重试属于同一次调用');
+  const sent = mock.calls.filter((x) => x.path.startsWith('/maxtok/') && x.body.tools);
+  assert.equal(sent[0].body.max_tokens, 512);
+  const last = sent.at(-1)!.body;
+  assert.equal(last.max_tokens, undefined);
+  assert.equal(last.max_completion_tokens, 512);
+  assert.equal(last.reasoning_effort, 'high');
+});
+
+test('未调用工具：下一次强制 tool_choice=required；输出截断时提示模型，思考内容与正文分开记录', async () => {
+  const cfg = await createConfig(draft({ name: 'chatty', baseUrl: `${base}/chatty/v1` }));
+  mock.calls = [];
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  const contestant = run.contestants[0];
+  assert.equal(contestant.status, 'solved');
+  const sent = mock.calls.filter((x) => x.path.startsWith('/chatty/'));
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0].body.tool_choice, 'auto');
+  assert.equal(sent[1].body.tool_choice, 'required');
+  assert.match(sent[1].body.messages[1].content, /截断/);
+  const first = contestant.trace.find((t) => t.type === 'call') as any;
+  assert.equal(first.text, '我来分析一下');
+  assert.equal(first.reasoning, '观察展开图\n\n先看 U 面');
+  assert.equal(first.truncated, true);
+  assert.ok(contestant.trace.some((t) => t.type === 'log' && /截断/.test(t.text)));
+});
+
+test('强制工具调用被拒绝：回退为 auto 继续，不误判为推理强度不受支持', async () => {
+  const cfg = await createConfig(draft({ name: 'nochoice', baseUrl: `${base}/nochoice/v1` }));
+  mock.calls = [];
+  const run = new Run([E(cfg, 'low')], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  const c = run.contestants[0].snapshot();
+  assert.equal(c.status, 'solved');
+  assert.ok(!c.stats.effortIgnored);
+  assert.equal(c.stats.apiCalls, 2, '被拒绝的 required 请求不计入调用');
+  const sent = mock.calls.filter((x) => x.path.startsWith('/nochoice/'));
+  assert.deepEqual(sent.map((x) => x.body.tool_choice), ['auto', 'required', 'auto']);
+  assert.equal(sent[2].body.reasoning_effort, 'low');
+  assert.ok(run.contestants[0].trace.some((t) => t.type === 'log' && /强制工具调用/.test(t.text)));
 });
 
 test.after(() => server.close());

@@ -222,6 +222,10 @@ export type TraceItem =
       n: number;
       latencyMs: number;
       text: string;
+      /** 模型返回的思考内容（过长时保留首尾）；未返回则省略 */
+      reasoning?: string;
+      /** 输出达到最大输出 Token 被截断 */
+      truncated?: boolean;
       tools: { moves: string[]; ok: boolean; error?: string }[];
       usage?: { input: number | null; output: number | null; reasoning: number | null };
       outcome?: 'success' | 'error';

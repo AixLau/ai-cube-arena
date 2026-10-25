@@ -111,6 +111,8 @@ export function safeLookup(hostname: string, options: dns.LookupOptions, callbac
 
 export const safeDispatcher = new Agent({
   connect: { lookup: safeLookup as unknown as net.LookupFunction },
-  headersTimeout: 180_000,
-  bodyTimeout: 180_000,
+  // 不在连接层设上限：各调用方用 AbortSignal 自行控制（评测请求按设计不限时，模型列表 / 测试连接各有超时），
+  // 否则长时间思考的非流式请求会在 180 秒时被 undici 静默中断并重试，重复计费
+  headersTimeout: 0,
+  bodyTimeout: 0,
 });

@@ -39,6 +39,7 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
       body.tool_choice = ctx.toolChoice;
     }
     if (ctx.reasoningEffort !== 'default') body.reasoning = { effort: ctx.reasoningEffort };
+    if (ctx.maxOutputTokens) body.max_output_tokens = ctx.maxOutputTokens;
 
     const { json } = await postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), body, {
       signal: ctx.signal,
@@ -48,19 +49,25 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
     if (!Array.isArray(json?.output)) throw new ProviderError('parse', '响应中缺少 output 数组（该地址可能不支持 Responses API）');
     const toolCalls: ToolCall[] = [];
     let text = '';
+    const thoughts: string[] = [];
     for (const it of json.output) {
       if (it.type === 'function_call') {
         toolCalls.push({ id: String(it.call_id ?? it.id), name: String(it.name), ...parseArgs(it.arguments) });
       } else if (it.type === 'message') {
         text += (it.content ?? []).filter((c: any) => c.type === 'output_text').map((c: any) => c.text).join('');
+      } else if (it.type === 'reasoning') {
+        // 推理摘要（summary_text），开源推理模型可能直接给出 reasoning_text
+        for (const p of [...(it.summary ?? []), ...(it.content ?? [])]) if (typeof p?.text === 'string' && p.text.trim()) thoughts.push(p.text.trim());
       }
     }
     const u = json.usage;
     return {
       text,
+      reasoning: thoughts.join('\n\n'),
       toolCalls,
       raw: json.output,
       finishReason: json.status ?? null,
+      truncated: json.status === 'incomplete' && json.incomplete_details?.reason === 'max_output_tokens',
       usage: u
         ? {
             input: usageNum(u.input_tokens),

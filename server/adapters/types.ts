@@ -33,10 +33,14 @@ export interface Usage {
 
 export interface TurnResult {
   text: string;
+  /** 供应商返回的思考内容（reasoning_content、thinking 块、推理摘要等），未返回为空字符串 */
+  reasoning: string;
   toolCalls: ToolCall[];
   usage: Usage | null;
   raw: unknown;
   finishReason: string | null;
+  /** 输出达到最大输出 Token 被截断，工具调用可能缺失或参数不完整 */
+  truncated: boolean;
 }
 
 export interface CallContext {
@@ -44,6 +48,8 @@ export interface CallContext {
   model: string;
   /** default 表示不发送推理强度参数 */
   reasoningEffort: ReasoningEffort;
+  /** 单次回复最大输出 Token；不设置则交给供应商默认 */
+  maxOutputTokens?: number | null;
   endpoint: string;
   apiKey: string | undefined;
   system: string;
@@ -51,7 +57,7 @@ export interface CallContext {
   turns: Turn[];
   toolChoice: 'auto' | 'required';
   signal: AbortSignal;
-  /** null 表示不限制单次请求时长，由手动停止控制 */
+  /** null 表示不限制单次请求时长，由整局限制或手动停止控制 */
   timeoutMs: number | null;
 }
 
@@ -69,6 +75,16 @@ export function parseArgs(raw: unknown): { args: Record<string, unknown> | null;
   } catch {
     return { args: null, argsError: '工具参数不是合法 JSON' };
   }
+}
+
+/** 部分模型（如经中转的 R1 类模型）把思考写在正文的 <think>…</think> 中：拆出思考，正文只保留回答；未闭合视为被截断的思考 */
+export function splitThinkTags(content: string): { text: string; reasoning: string } {
+  const thoughts: string[] = [];
+  const text = content.replace(/<think>([\s\S]*?)(?:<\/think>|$)/g, (_, t: string) => {
+    thoughts.push(t.trim());
+    return '';
+  });
+  return thoughts.length ? { text: text.trim(), reasoning: thoughts.filter(Boolean).join('\n\n') } : { text: content, reasoning: '' };
 }
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
