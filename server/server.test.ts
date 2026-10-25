@@ -85,9 +85,9 @@ const server = http.createServer((req, res) => {
       const wantsTool = Array.isArray(body.tools);
       const isPing = body.tools?.[0]?.function?.name === 'ping';
       const noUsage = url.startsWith('/nousage/');
-      const wrongFirst = url.startsWith('/wrong/') && !body.messages.some((m: any) => m.role === 'tool');
+      const wrongFirst = url.startsWith('/wrong/') && mock.calls.filter((c) => c.path.startsWith('/wrong/') && c.path.endsWith('/chat/completions')).length === 1;
       // spin：先转 26 次 × 10 步 U（共 260 步，净效果为零），再给出解法
-      const spinning = url.startsWith('/spin/') && body.messages.filter((m: any) => m.role === 'tool').length < 26;
+      const spinning = url.startsWith('/spin/') && mock.calls.filter((c) => c.path.startsWith('/spin/') && c.path.endsWith('/chat/completions')).length <= 26;
       return json(200, {
         choices: [{
           finish_reason: 'tool_calls',
@@ -258,9 +258,11 @@ test('多模型同题评测：同一初始状态、独立状态、真正并发�
   for (const c of mock.calls) assert.ok(!JSON.stringify(c.body).includes(scramble), '请求中不应出现打乱公式');
   // 请求中不出现其它选手或服务端的密钥以外的内容：Authorization 正确
   assert.equal(first[0].headers.authorization, 'Bearer sk-test-1234567890abcdef');
-  // 思考模式的 reasoning_content 在后续请求中回传
-  const second = mock.calls.find((c) => c.path.startsWith('/wrong/') && c.body.messages.some((m: any) => m.role === 'tool'));
-  assert.ok(second?.body.messages.some((m: any) => m.role === 'assistant' && m.reasoning_content === 'thinking…'));
+  // 每次请求只携带最新状态，不回放会造成 Token 线性累加的历史消息
+  const wrongCalls = mock.calls.filter((c) => c.path.startsWith('/wrong/') && c.path.endsWith('/chat/completions'));
+  assert.ok(wrongCalls.length >= 2);
+  assert.ok(wrongCalls.every((c) => c.body.messages.filter((m: any) => m.role === 'assistant' || m.role === 'tool').length === 0));
+  assert.ok(wrongCalls[1].body.messages[1].content.includes('上一轮工具执行摘要'));
   // 事件中不出现密钥
   assert.ok(!JSON.stringify(run.events).includes('sk-test-1234567890abcdef'));
   mock.delayMs = 0;
@@ -310,6 +312,8 @@ test('不限制总旋转次数：超过 200 步后仍可继续并复原', async 
   const c = run.contestants[0].snapshot();
   assert.equal(c.status, 'solved');
   assert.equal(c.stats.moves, 260 + mock.solution.length);
+  const spinCalls = mock.calls.filter((x) => x.path.startsWith('/spin/') && x.path.endsWith('/chat/completions'));
+  assert.ok(spinCalls.every((x) => x.body.messages.length === 2), '长评测不能回放完整对话历史');
 });
 
 test('供应商：保存后自动获取模型列表；不支持列表时可手动补充', async () => {

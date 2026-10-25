@@ -62,9 +62,6 @@ const REQUEST_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 180_000);
 const MAX_RETRIES = 2;
 /** 限流（429）的重试次数（不计入预算，但受最大运行时间约束） */
 const MAX_THROTTLE_RETRIES = 8;
-/** 只保留最近几次工具结果中的完整状态，更早的结果压缩，控制上下文长度（对所有模型一致） */
-const FULL_STATE_RESULTS = 2;
-
 /** 推理强度参数被拒绝时，上游错误信息通常会提到这些字段 */
 const EFFORT_REJECT_RE = /reasoning|effort|thinking|budget|unrecognized|unknown (field|param)|unsupported|not support|extra (fields|inputs)/i;
 
@@ -268,30 +265,14 @@ export class Contestant {
     };
   }
 
-  /** 旧的工具结果去掉完整状态，只保留执行摘要 */
-  private compactTurns(turns: Turn[]): Turn[] {
-    let fullLeft = FULL_STATE_RESULTS;
-    const out = [...turns];
-    for (let i = out.length - 1; i >= 0; i--) {
-      const t = out[i];
-      if (t.role !== 'tool') continue;
-      if (fullLeft > 0) {
-        fullLeft--;
-        continue;
-      }
-      out[i] = {
-        role: 'tool',
-        results: t.results.map((r) => {
-          try {
-            const { state: _s, ...rest } = JSON.parse(r.content);
-            return { ...r, content: JSON.stringify({ ...rest, state: '（较早的状态已省略，请以最新结果为准）' }) };
-          } catch {
-            return r;
-          }
-        }),
-      };
-    }
-    return out;
+  /**
+   * 每次模型请求都从当前状态重新开始一轮短上下文。
+   * 魔方状态已经包含此前所有动作的结果，继续回放 assistant 的
+   * reasoning_content / tool_calls 会让供应商在每轮重复计费整段历史。
+   */
+  private stateTurn(feedback = ''): Turn {
+    const text = feedback ? `${initialUserMessage(this.state)}\n\n${feedback}` : initialUserMessage(this.state);
+    return { role: 'user', text };
   }
 
   async start() {
@@ -320,7 +301,8 @@ export class Contestant {
     const endpoint = resolveEndpoint(this.config.protocol, this.config.baseUrl, this.model);
     const tools = [rotateCubeTool(limits)];
     const system = systemPrompt(limits, this.run.cubeSize);
-    const turns: Turn[] = [{ role: 'user', text: initialUserMessage(this.state) }];
+    // 不把上一轮的 assistant/tool 历史带回供应商；当前状态是完整事实来源。
+    let turns: Turn[] = [this.stateTurn()];
     const limiter = credentialLimiter(hostOf(endpoint), apiKey, this.config.maxConcurrentRequests);
     let noToolStreak = 0;
 
@@ -346,7 +328,7 @@ export class Contestant {
           try {
             result = await adapter.call({
               config: this.config, model: this.model, reasoningEffort: this.effort,
-              endpoint, apiKey, system, tools, turns: this.compactTurns(turns),
+              endpoint, apiKey, system, tools, turns,
               toolChoice: 'auto', signal: this.abort.signal, timeoutMs: Math.max(1000, Math.min(REQUEST_TIMEOUT_MS, remainingMs)),
             });
             this.stats.lastLatencyMs = Date.now() - started;
@@ -396,19 +378,16 @@ export class Contestant {
         }
 
         this.addUsage(result.usage);
-        turns.push({ role: 'assistant', text: result.text, toolCalls: result.toolCalls, raw: result.raw });
-
         if (!result.toolCalls.length) {
           noToolStreak++;
           this.recordCall(result.text, []);
           this.emitStats();
           if (noToolStreak >= 3) return this.setStatus('failed', '模型连续 3 次未调用 rotate_cube');
-          turns.push({ role: 'user', text: NO_TOOL_NUDGE });
+          turns = [this.stateTurn(NO_TOOL_NUDGE)];
           continue;
         }
         noToolStreak = 0;
 
-        const results: { callId: string; name: string; content: string }[] = [];
         const summaries: { moves: string[]; ok: boolean; error?: string }[] = [];
         for (const call of result.toolCalls) {
           this.stats.toolCalls++;
@@ -417,13 +396,17 @@ export class Contestant {
           const r = blocked
             ? { content: JSON.stringify({ ok: false, error: blocked, executed: [] }), moves: [], ok: false, error: blocked }
             : await this.executeTool(call);
-          results.push({ callId: call.id, name: call.name, content: r.content });
           summaries.push({ moves: r.moves, ok: r.ok, error: r.error });
         }
-        turns.push({ role: 'tool', results });
         this.recordCall(result.text, summaries);
         this.emitStats();
         if (isSolved(this.state)) return this.setStatus('solved');
+
+        const feedback = summaries.map((s) => {
+          if (s.ok) return `已执行：${s.moves.join(' ') || '无'}`;
+          return `工具调用未执行：${s.error ?? '未知错误'}`;
+        }).join('\n');
+        turns = [this.stateTurn(`上一轮工具执行摘要：\n${feedback}\n请继续调用 rotate_cube。`)];
       }
     } catch (e) {
       if (e instanceof StopSignal || this.abort.signal.aborted) return this.setStatus('stopped', this.failReason ?? '已手动停止');
