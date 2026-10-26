@@ -8,6 +8,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 const apiKey = process.env.REAL_PROVIDER_API_KEY?.trim();
 const requestedBase = process.env.REAL_PROVIDER_BASE_URL?.trim() || 'https://o10.top';
 const requestedModel = process.env.REAL_PROVIDER_MODEL?.trim() || '';
+const multiCount = Math.max(1, Number(process.env.REAL_PROVIDER_MULTI || 1));
+const keepAliveMs = Math.max(0, Number(process.env.REAL_PROVIDER_KEEP_ALIVE_MS || 0));
 const localOrigin = process.env.REAL_PROVIDER_LOCAL_ORIGIN?.replace(/\/$/, '') || 'http://127.0.0.1:8787';
 const protocol = process.env.REAL_PROVIDER_PROTOCOL || 'openai-chat';
 if (!apiKey) throw new Error('REAL_PROVIDER_API_KEY is required; it is read only from the process environment.');
@@ -125,9 +127,12 @@ try {
     refreshed = result;
   }
   const models = refreshed.models || [];
-  const model = requestedModel || models[0];
-  if (!model) throw new Error('No model returned. Set REAL_PROVIDER_MODEL to a model ID supported by the provider.');
-  const cfg = config(usedBase, [model]);
+  const selectedModels = requestedModel
+    ? requestedModel.split(',').map((model) => model.trim()).filter(Boolean)
+    : models.slice(0, multiCount);
+  if (selectedModels.length < multiCount) throw new Error(`Provider returned ${selectedModels.length} models; need ${multiCount}. Set REAL_PROVIDER_MODEL to a comma-separated model list or reduce REAL_PROVIDER_MULTI.`);
+  const model = selectedModels[0];
+  const cfg = config(usedBase, selectedModels);
 
   const test = await json('/api/providers/test', {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -138,13 +143,14 @@ try {
   const started = await json('/api/runs', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      entries: [{ providerId: cfg.id, model, reasoningEffort: 'default', maxOutputTokens: 512 }],
+      entries: selectedModels.map((selectedModel) => ({ providerId: cfg.id, model: selectedModel, reasoningEffort: 'default', maxOutputTokens: 512 })),
       providers: [{ config: cfg, apiKey }],
       cubeSize: 2,
       scrambleLength: 1,
-      limits: { maxDurationSec: 90, maxApiCalls: 4, maxMovesPerCall: 4, maxNoToolCalls: 2, maxNoProgressCalls: 2, concurrency: 1, requestTimeoutSec: 30 },
+      limits: { maxDurationSec: 90, maxApiCalls: Number(process.env.REAL_PROVIDER_MAX_API_CALLS || (multiCount > 1 ? 1 : 4)), maxMovesPerCall: 4, maxNoToolCalls: 2, maxNoProgressCalls: 2, concurrency: Math.min(8, selectedModels.length), requestTimeoutSec: 30 },
     }),
   });
+  console.log(JSON.stringify({ phase: 'started', localOrigin, runId: started.id, models: selectedModels }));
   let events;
   let reconnectReport = null;
   if (process.env.REAL_PROVIDER_DISCONNECT === '1') {
@@ -160,11 +166,12 @@ try {
   const contestant = record.contestants[0];
   console.log(JSON.stringify({
     provider: new URL(usedBase).host,
-    model,
+    models: selectedModels,
     connectionTest: { ok: test.ok, toolSupport: test.toolSupport, usageReported: test.usageReported },
-    run: { id: started.id, eventTypes: [...new Set(events.map((e) => e.type))], status: record.status, contestantStatus: contestant.status, apiCalls: contestant.stats.apiCalls, cost: contestant.stats.cost },
+    run: { id: started.id, eventTypes: [...new Set(events.map((e) => e.type))], status: record.status, contestants: record.contestants.map((item) => ({ model: item.info.model, status: item.status, apiCalls: item.stats.apiCalls, cost: item.stats.cost })), cost: record.contestants.reduce((sum, item) => sum + (item.stats.cost || 0), 0) || null },
     disconnectRecovery: reconnectReport,
   }, null, 2));
+  if (keepAliveMs) await delay(keepAliveMs);
 } finally {
   await stop();
 }
