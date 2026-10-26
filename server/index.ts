@@ -9,7 +9,7 @@ import {
 } from '../shared/types.ts';
 import { STATE_ENCODING } from './arena/prompt.ts';
 import { MAX_ACTIVE_SESSIONS, Run, runs, type ContestantEntry } from './arena/run.ts';
-import { listRuns, loadRun, migrateLegacyRuns } from './arena/store.ts';
+import { listRuns, loadRun, migrateLegacyRun, migrateLegacyRuns } from './arena/store.ts';
 import {
   DraftError, modelsOf, normalizeProvider, refreshProvider, validateApiKey,
 } from './providers/store.ts';
@@ -69,12 +69,16 @@ function clientRecordOf(record: RunRecord): Omit<RunRecord, 'ownerId'> {
 }
 
 const OWNER_COOKIE = 'cube_arena_owner';
+const SINGLE_USER_MODE = process.env.SINGLE_USER_MODE === 'true' || process.env.NODE_ENV !== 'production';
 function requestOwner(req: Request): string | undefined {
   const raw = req.headers.cookie ?? '';
   return raw.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${OWNER_COOKIE}=`))?.slice(OWNER_COOKIE.length + 1);
 }
 
 function ensureOwner(req: Request, res: Response): string {
+  if (process.env.NODE_ENV === 'production' && !req.secure && process.env.REQUIRE_HTTPS !== 'true') {
+    throw new DraftError('生产环境必须启用 HTTPS（设置 REQUIRE_HTTPS=true 并正确配置 TRUST_PROXY）');
+  }
   const existing = requestOwner(req);
   if (existing) return existing;
   const owner = randomUUID();
@@ -182,7 +186,7 @@ app.post('/api/runs', wrap(async (req, res) => {
 
 app.get('/api/runs', wrap(async (_req, res) => {
   const owner = requestOwner(_req);
-  if (owner) await migrateLegacyRuns(owner);
+  if (owner && SINGLE_USER_MODE) await migrateLegacyRuns(owner);
   const live = [...runs.values()].filter((r) => !r.done && owns(r, owner)).map((r) => r.publicSummary());
   const saved = (await listRuns()).filter((s) => s.ownerId === owner && !live.some((l) => l.id === s.id)).map(publicSummaryOf);
   res.json([...live, ...saved]);
@@ -192,6 +196,7 @@ app.get('/api/runs/:id', wrap(async (req, res) => {
   const live = runs.get(String(req.params.id));
   if (live && !owns(live, requestOwner(req))) return res.status(404).json({ error: '记录不存在' });
   if (live) return res.json(live.publicRecord());
+  if (SINGLE_USER_MODE && requestOwner(req)) await migrateLegacyRun(String(req.params.id), requestOwner(req)!);
   const record = await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
   if (!owns({ ownerId: record.ownerId } as Run, requestOwner(req))) return res.status(404).json({ error: '记录不存在' });
@@ -203,6 +208,7 @@ app.get('/api/runs/:id/report', wrap(async (req, res) => {
   const live = runs.get(String(req.params.id));
   if (live && !owns(live, requestOwner(req))) return res.status(404).json({ error: '记录不存在' });
   if (live && !live.done) return res.status(409).json({ error: '评测尚未结束' });
+  if (!live && SINGLE_USER_MODE && requestOwner(req)) await migrateLegacyRun(String(req.params.id), requestOwner(req)!);
   const record = live ? live.reportRecord() : await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
   if (!live && record.ownerId !== requestOwner(req)) return res.status(404).json({ error: '记录不存在' });
@@ -214,6 +220,7 @@ app.get('/api/runs/:id/export', wrap(async (req, res) => {
   const live = runs.get(String(req.params.id));
   if (live && !owns(live, requestOwner(req))) return res.status(404).json({ error: '记录不存在' });
   if (live && !live.done) return res.status(409).json({ error: '评测尚未结束，暂不可导出' });
+  if (!live && SINGLE_USER_MODE && requestOwner(req)) await migrateLegacyRun(String(req.params.id), requestOwner(req)!);
   const record = live ? live.reportRecord() : await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
   if (!live && record.ownerId !== requestOwner(req)) return res.status(404).json({ error: '记录不存在' });

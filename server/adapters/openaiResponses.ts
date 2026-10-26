@@ -131,7 +131,7 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
       const name = normalizeToolName(it.name, allowedTools);
       if (!name) continue;
       const callId = normalizeToolCallId(it.call_id ?? it.id, `responses_call_${index}`);
-      rawOutput.push({ ...it, id: it.id ?? callId, call_id: callId, name, arguments: normalizeArguments(it.arguments), _originalArguments: it.arguments });
+      rawOutput.push({ ...it, id: normalizeToolCallId(it.id, `responses_item_${index}`), call_id: callId, name, arguments: normalizeArguments(it.arguments), _originalArguments: it.arguments });
     }
     for (const it of rawOutput) {
       if (!it || typeof it !== 'object') throw new ProviderError('parse', 'Responses output 包含无效 item');

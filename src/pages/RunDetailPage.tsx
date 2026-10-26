@@ -110,6 +110,7 @@ export default function RunDetailPage() {
           <a className="btn ghost" href={api.exportUrl(record.id)} download>导出 JSON</a>
         </div>
       </div>
+      {record.reportIncomplete && <div className="connection-banner" role="status"><b>报告不完整。</b> 运行摘要已保存，但详细轨迹因容量限制未保留，无法完整回放。</div>}
 
       <section className="glass panel" style={{ marginBottom: 20 }}>
         <h2 className="panel-title">测试规则</h2>

@@ -120,15 +120,25 @@ export function useRunStream(runId: string | null): RunView {
     const es = new EventSource(api.streamUrl(runId));
     let done = false;
     let recoveryInFlight = false;
+    let hydrating = false;
+    let hydrateWatermark = 0;
+    const pendingDuringHydrate: { seq: number; event: RunEvent }[] = [];
     const seen = seenRef.current;
-    const recover = () => {
+    const recover = (watermark = 0) => {
       if (recoveryInFlight) return;
       recoveryInFlight = true;
+      hydrating = watermark > 0;
+      hydrateWatermark = watermark;
       void api.run(runId).then((record) => {
         dispatch({ type: 'hydrate', record });
         done = record.status === 'finished';
+        hydrating = false;
+        pendingDuringHydrate.sort((a, b) => a.seq - b.seq).forEach(({ seq, event }) => {
+          if (seq > hydrateWatermark) dispatch({ type: 'event', e: event });
+        });
+        pendingDuringHydrate.length = 0;
         if (done) es.close();
-      }).catch(() => {}).finally(() => { recoveryInFlight = false; });
+      }).catch(() => { hydrating = false; pendingDuringHydrate.length = 0; }).finally(() => { recoveryInFlight = false; });
     };
     es.onopen = () => dispatch({ type: 'connection', state: 'open' });
     es.onmessage = (msg) => {
@@ -142,6 +152,8 @@ export function useRunStream(runId: string | null): RunView {
           const seq = (payload as RunEventEnvelope).seq;
           if (seen.has(`seq:${seq}`)) return;
           seen.add(`seq:${seq}`);
+          while (seen.size > 20_000) seen.delete(seen.values().next().value as string);
+          if (hydrating) { pendingDuringHydrate.push({ seq, event: e }); return; }
         }
       } catch { return; }
       if (!hasSeq) {
@@ -152,7 +164,7 @@ export function useRunStream(runId: string | null): RunView {
         done = true;
         es.close();
       }
-      if (e.type === 'reset') { recover(); return; }
+      if (e.type === 'reset') { recover(e.latestSeq); return; }
       dispatch({ type: 'event', e });
     };
     es.onerror = () => {

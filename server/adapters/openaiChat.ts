@@ -59,6 +59,7 @@ export const openaiChatAdapter: ProtocolAdapter = {
     const choice = json.choices[0];
     if (!choice || typeof choice !== 'object' || !choice.message || typeof choice.message !== 'object' || Array.isArray(choice.message)) throw new ProviderError('parse', '响应中缺少 choices[0].message 对象');
     const message = choice.message;
+    if (message.tool_calls != null && !Array.isArray(message.tool_calls)) throw new ProviderError('parse', 'Chat message.tool_calls 不是数组');
     const allowedTools = new Set(ctx.tools.map((tool) => tool.name));
     const normalizedCalls = (Array.isArray(message.tool_calls) ? message.tool_calls : [])
       .map((c: any, i: number) => {

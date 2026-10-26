@@ -887,7 +887,7 @@ export class Run {
   }
 
   reportRecord(): RunRecord {
-    const traces = Object.fromEntries(this.contestants.map((c) => [c.info.id, c.trace.map((item) => {
+    const traces = this.reportIncomplete ? {} : Object.fromEntries(this.contestants.map((c) => [c.info.id, c.trace.map((item) => {
       if (item.type !== 'call' || !('reasoning' in item)) return item;
       const { reasoning: _reasoning, ...reportItem } = item;
       return reportItem;

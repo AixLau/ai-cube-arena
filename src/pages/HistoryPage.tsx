@@ -70,7 +70,7 @@ export default function HistoryPage({ embedded = false }: { embedded?: boolean }
                     <td>{r.cubeSize ?? 3}×{r.cubeSize ?? 3} · {scrambleLengthOf(r)} 步</td>
                     <td className="cell-models">{r.contestants.map((c) => c.info.model).join('、')}</td>
                     <td className="r">{solved}/{r.contestants.length}</td>
-                    <td>{r.status === 'running' ? <span className="badge running"><span className="dot" />进行中</span> : '已结束'}</td>
+                    <td>{r.status === 'running' ? <span className="badge running"><span className="dot" />进行中</span> : r.reportIncomplete ? <span className="badge warn">报告不完整</span> : '已结束'}</td>
                     <td className="mono cell-sub">题目受保护</td>
                     <td>
                       {r.status === 'running'

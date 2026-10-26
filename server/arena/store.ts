@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { RunRecord, RunSummary } from '../../shared/types.ts';
 
@@ -7,6 +7,7 @@ const SAFE_ID = /^[0-9a-f-]{36}$/;
 export const MAX_REPORT_BYTES = 8 * 1024 * 1024;
 
 let index: RunSummary[] | null = null;
+let migration: Promise<void> | null = null;
 
 export async function listRuns(): Promise<RunSummary[]> {
   if (index) return index;
@@ -30,21 +31,41 @@ export async function listRuns(): Promise<RunSummary[]> {
 
 /** 单用户升级兼容：首次带 owner cookie 访问时，将旧记录绑定到该浏览器会话。 */
 export async function migrateLegacyRuns(ownerId: string): Promise<void> {
-  let changed = false;
+  if (migration) return migration;
+  migration = (async () => {
+    let changed = false;
+    try {
+      for (const f of await readdir(RUN_DIR)) {
+        if (!f.endsWith('.json')) continue;
+        const file = path.join(RUN_DIR, f);
+        try {
+          const record = JSON.parse(await readFile(file, 'utf8')) as RunRecord;
+          if (record.ownerId) continue;
+          record.ownerId = ownerId;
+          const temp = `${file}.${ownerId}.tmp`;
+          await writeFile(temp, JSON.stringify(record));
+          await rename(temp, file);
+          changed = true;
+        } catch { /* 跳过损坏文件 */ }
+      }
+    } catch { /* 目录不存在 */ }
+    if (changed) index = null;
+  })().finally(() => { migration = null; });
+  return migration;
+}
+
+export async function migrateLegacyRun(id: string, ownerId: string): Promise<void> {
+  if (!SAFE_ID.test(id)) return;
+  const file = path.join(RUN_DIR, `${id}.json`);
   try {
-    for (const f of await readdir(RUN_DIR)) {
-      if (!f.endsWith('.json')) continue;
-      const file = path.join(RUN_DIR, f);
-      try {
-        const record = JSON.parse(await readFile(file, 'utf8')) as RunRecord;
-        if (record.ownerId) continue;
-        record.ownerId = ownerId;
-        await writeFile(file, JSON.stringify(record));
-        changed = true;
-      } catch { /* 跳过损坏文件 */ }
-    }
-  } catch { /* 目录不存在 */ }
-  if (changed) index = null;
+    const record = JSON.parse(await readFile(file, 'utf8')) as RunRecord;
+    if (record.ownerId) return;
+    record.ownerId = ownerId;
+    const temp = `${file}.${ownerId}.tmp`;
+    await writeFile(temp, JSON.stringify(record));
+    await rename(temp, file);
+    index = null;
+  } catch { /* 由调用方按不存在处理 */ }
 }
 
 export async function saveRun(record: RunRecord): Promise<boolean> {

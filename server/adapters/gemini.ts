@@ -87,6 +87,7 @@ export const geminiAdapter: ProtocolAdapter = {
     parts.forEach((p, i) => {
       if (!p || typeof p !== 'object') throw new ProviderError('parse', 'Gemini content part 不是对象');
       if (p.functionCall) {
+        if (typeof p.functionCall !== 'object' || Array.isArray(p.functionCall)) throw new ProviderError('parse', 'Gemini functionCall 不是对象');
         const args = p.functionCall.args;
         const ok = !args || (typeof args === 'object' && !Array.isArray(args));
         const name = normalizeToolName(p.functionCall.name, allowedTools);
