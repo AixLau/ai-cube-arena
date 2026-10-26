@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -51,14 +52,32 @@ function stripReasoning<T extends { traces: Record<string, any[]> }>(record: T):
 }
 
 function publicSummaryOf(summary: RunSummary): PublicRunSummary {
-  const { scramble: _scramble, initialState: _initialState, ...publicSummary } = summary;
+  const { scramble: _scramble, initialState: _initialState, ownerId: _ownerId, ...publicSummary } = summary;
   return publicSummary;
 }
 
 function publicRecordOf(record: RunRecord): PublicRunRecord {
   const safe = stripReasoning(record);
-  const { scramble: _scramble, initialState: _initialState, ...publicRecord } = safe;
+  const { scramble: _scramble, initialState: _initialState, ownerId: _ownerId, ...publicRecord } = safe;
   return publicRecord;
+}
+
+const OWNER_COOKIE = 'cube_arena_owner';
+function requestOwner(req: Request): string | undefined {
+  const raw = req.headers.cookie ?? '';
+  return raw.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${OWNER_COOKIE}=`))?.slice(OWNER_COOKIE.length + 1);
+}
+
+function ensureOwner(req: Request, res: Response): string {
+  const existing = requestOwner(req);
+  if (existing) return existing;
+  const owner = randomUUID();
+  res.append('Set-Cookie', `${OWNER_COOKIE}=${owner}; Path=/; HttpOnly; SameSite=Strict${req.secure ? '; Secure' : ''}`);
+  return owner;
+}
+
+function owns(run: Run, owner: string | undefined): boolean {
+  return !!owner && !!run.ownerId && run.ownerId === owner;
 }
 
 // ---------------- 元数据 ----------------
@@ -148,41 +167,48 @@ app.post('/api/runs', wrap(async (req, res) => {
     concurrency: clamp(limits.concurrency, 1, 64, DEFAULT_LIMITS.concurrency),
     requestTimeoutSec: clamp(limits.requestTimeoutSec, 10, 600, DEFAULT_LIMITS.requestTimeoutSec),
   };
-  const run = new Run(contestants, diff, l, cubeSize);
+  const run = new Run(contestants, diff, l, cubeSize, ensureOwner(req, res));
   runs.set(run.id, run);
   void run.start();
   res.json({ id: run.id });
 }));
 
 app.get('/api/runs', wrap(async (_req, res) => {
-  const live = [...runs.values()].filter((r) => !r.done).map((r) => r.publicSummary());
-  const saved = (await listRuns()).filter((s) => !live.some((l) => l.id === s.id)).map(publicSummaryOf);
+  const owner = requestOwner(_req);
+  const live = [...runs.values()].filter((r) => !r.done && owns(r, owner)).map((r) => r.publicSummary());
+  const saved = (await listRuns()).filter((s) => s.ownerId === owner && !live.some((l) => l.id === s.id)).map(publicSummaryOf);
   res.json([...live, ...saved]);
 }));
 
 app.get('/api/runs/:id', wrap(async (req, res) => {
   const live = runs.get(String(req.params.id));
+  if (live && !owns(live, requestOwner(req))) return res.status(404).json({ error: '记录不存在' });
   if (live) return res.json(live.publicRecord());
   const record = await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
+  if (!owns({ ownerId: record.ownerId } as Run, requestOwner(req))) return res.status(404).json({ error: '记录不存在' });
   res.json(publicRecordOf(record));
 }));
 
 /** 私有报告接口：供报告页和导出使用；共享部署应在此处增加 ownership 鉴权。 */
 app.get('/api/runs/:id/report', wrap(async (req, res) => {
   const live = runs.get(String(req.params.id));
+  if (live && !owns(live, requestOwner(req))) return res.status(404).json({ error: '记录不存在' });
   if (live && !live.done) return res.status(409).json({ error: '评测尚未结束' });
   const record = live ? live.reportRecord() : await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
+  if (!live && record.ownerId !== requestOwner(req)) return res.status(404).json({ error: '记录不存在' });
   res.json(stripReasoning(record));
 }));
 
 /** 导出评测记录（不含任何密钥） */
 app.get('/api/runs/:id/export', wrap(async (req, res) => {
   const live = runs.get(String(req.params.id));
+  if (live && !owns(live, requestOwner(req))) return res.status(404).json({ error: '记录不存在' });
   if (live && !live.done) return res.status(409).json({ error: '评测尚未结束，暂不可导出' });
   const record = live ? live.reportRecord() : await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
+  if (!live && record.ownerId !== requestOwner(req)) return res.status(404).json({ error: '记录不存在' });
   const safeRecord = stripReasoning(record);
   res.setHeader('Content-Disposition', `attachment; filename="cube-run-${record.id.slice(0, 8)}.json"`);
   res.json({ format: 'ai-cube-arena/run@1', stateEncoding: STATE_ENCODING, ...safeRecord });
@@ -192,13 +218,15 @@ app.get('/api/runs/:id/export', wrap(async (req, res) => {
 app.get('/api/runs/:id/stream', (req, res) => {
   const run = runs.get(String(req.params.id));
   if (!run) return res.status(404).end();
+  if (!owns(run, requestOwner(req))) return res.status(404).end();
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
-  const after = Number(req.get('Last-Event-ID') ?? 0);
+  const parsedAfter = Number(req.get('Last-Event-ID') ?? 0);
+  const after = Number.isSafeInteger(parsedAfter) && parsedAfter >= 0 ? parsedAfter : 0;
   let closed = false;
   let unsubscribe = () => {};
   let lastSentSeq = after;
@@ -223,6 +251,11 @@ app.get('/api/runs/:id/stream', (req, res) => {
       res.end();
     }
   };
+  const firstSeq = run.events[0]?.seq;
+  const latestSeq = run.events.at(-1)?.seq ?? 0;
+  if (firstSeq !== undefined && after < firstSeq - 1) {
+    send({ seq: firstSeq - 1, event: { type: 'reset', run: run.publicSummary(), minSeq: firstSeq, latestSeq } });
+  }
   unsubscribe = run.subscribeAndReplay(after, send);
   if (closed) unsubscribe();
   if (run.done && !closed) {
@@ -246,7 +279,7 @@ app.get('/api/runs/:id/stream', (req, res) => {
 for (const action of ['pause', 'resume', 'stop'] as const) {
   app.post(`/api/runs/:id/${action}`, (req, res) => {
     const run = runs.get(String(req.params.id));
-    if (!run || run.status === 'finished') return res.status(404).json({ error: '评测不存在或已结束' });
+    if (!run || !owns(run, requestOwner(req)) || run.status === 'finished') return res.status(404).json({ error: '评测不存在或已结束' });
     if (action === 'pause') run.pauseAll();
     else if (action === 'resume') run.resumeAll();
     else run.stopAll();
@@ -256,6 +289,7 @@ for (const action of ['pause', 'resume', 'stop'] as const) {
 
 app.post('/api/runs/:id/contestants/:cid/:action', (req, res) => {
   const run = runs.get(String(req.params.id));
+  if (run && !owns(run, requestOwner(req))) return res.status(404).json({ error: '选手不存在或评测已结束' });
   const c = run?.contestant(String(req.params.cid));
   if (!c) return res.status(404).json({ error: '选手不存在或评测已结束' });
   if (TERMINAL_STATUSES.includes(c.status)) return res.status(409).json({ error: '该模型已结束' });

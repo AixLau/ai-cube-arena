@@ -140,10 +140,13 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
         toolCalls.push({ id: String(it.call_id), name: String(it.name), ...args, ...(argumentsError(it._originalArguments) ? { args: null, argsError: argumentsError(it._originalArguments) } : {}) });
         delete it._originalArguments;
       } else if (it.type === 'message') {
-        text += (it.content ?? []).filter((c: any) => c.type === 'output_text').map((c: any) => c.text).join('');
+        if (!Array.isArray(it.content)) throw new ProviderError('parse', 'Responses message.content 不是数组');
+        text += it.content.filter((c: any) => c && typeof c === 'object' && c.type === 'output_text' && typeof c.text === 'string').map((c: any) => c.text).join('');
       } else if (it.type === 'reasoning') {
         // 推理摘要（summary_text），开源推理模型可能直接给出 reasoning_text
-        for (const p of [...(it.summary ?? []), ...(it.content ?? [])]) if (typeof p?.text === 'string' && p.text.trim()) thoughts.push(p.text.trim());
+        if (it.summary != null && !Array.isArray(it.summary)) throw new ProviderError('parse', 'Responses reasoning.summary 不是数组');
+        if (it.content != null && !Array.isArray(it.content)) throw new ProviderError('parse', 'Responses reasoning.content 不是数组');
+        for (const p of [...(it.summary ?? []), ...(it.content ?? [])]) if (p && typeof p === 'object' && typeof p.text === 'string' && p.text.trim()) thoughts.push(p.text.trim());
       }
     }
     const u = json.usage;

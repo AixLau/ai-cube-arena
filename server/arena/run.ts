@@ -21,19 +21,25 @@ import { saveRun } from './store.ts';
 /** 简单的计数信号量，用于单局并发与全局并发控制 */
 export class Semaphore {
   private waiters: (() => void)[] = [];
+  inUse = 0;
+  waiterCount = 0;
   constructor(private free: number) {}
   async acquire(signal?: AbortSignal, deadlineMs?: number): Promise<boolean> {
     if (deadlineMs != null && Date.now() >= deadlineMs) return false;
     if (this.free > 0) {
       this.free--;
+      this.inUse++;
       return true;
     }
     return new Promise<boolean>((resolve) => {
       let settled = false;
+      let queued = true;
       let timer: ReturnType<typeof setTimeout> | null = null;
       const finish = (value: boolean) => {
         if (settled) return;
         settled = true;
+        if (queued) { queued = false; this.waiterCount--; }
+        if (value) this.inUse++;
         if (timer) clearTimeout(timer);
         signal?.removeEventListener('abort', onAbort);
         resolve(value);
@@ -52,12 +58,14 @@ export class Semaphore {
         finish(true);
       };
       this.waiters.push(grant);
+      this.waiterCount++;
       if (deadlineMs != null) timer = setTimeout(onTimeout, Math.max(0, deadlineMs - Date.now()));
       if (signal?.aborted) onAbort();
       else signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
   release() {
+    if (this.inUse > 0) this.inUse--;
     const next = this.waiters.shift();
     if (next) next();
     else this.free++;
@@ -104,7 +112,9 @@ function credentialLimiter(host: string, apiKey: string | undefined, limit: numb
 
 setInterval(() => {
   const cutoff = Date.now() - 30 * 60_000;
-  for (const [key, entry] of credentialLimiters) if (entry.lastUsedAt < cutoff) credentialLimiters.delete(key);
+  for (const [key, entry] of credentialLimiters) {
+    if (entry.lastUsedAt < cutoff && entry.semaphore.inUse === 0 && entry.semaphore.waiterCount === 0) credentialLimiters.delete(key);
+  }
 }, 10 * 60_000).unref();
 
 /** 网络错误、超时、5xx 的重试次数（计入 API 调用预算） */
@@ -820,6 +830,7 @@ export class Run {
   readonly events: RunEventEnvelope[] = [];
   status: 'running' | 'finished' = 'running';
   finishedAt: string | null = null;
+  reportIncomplete = false;
   private doneEmitted = false;
   private eventSeq = 0;
   private listeners = new Set<Listener>();
@@ -829,6 +840,7 @@ export class Run {
     readonly difficulty: Difficulty,
     readonly limits: RunLimits,
     readonly cubeSize: number = 3,
+    readonly ownerId?: string,
   ) {
     // 服务端只打乱一次，所有选手共享同一个（不可变的）初始状态
     this.scramble = randomScramble(difficulty.scrambleLength, Math.random, cubeSize);
@@ -841,11 +853,13 @@ export class Run {
   summary(): RunSummary {
     return {
       id: this.id,
+      ownerId: this.ownerId,
       createdAt: this.createdAt,
       difficulty: this.difficulty.id,
       cubeSize: this.cubeSize,
       scrambleLength: this.difficulty.scrambleLength,
       finishedAt: this.finishedAt ?? undefined,
+      reportIncomplete: this.reportIncomplete || undefined,
       scramble: formatAlg(this.scramble),
       initialState: this.initialState.join(''),
       limits: this.limits,
@@ -855,7 +869,7 @@ export class Run {
   }
 
   publicSummary(): PublicRunSummary {
-    const { scramble: _scramble, initialState: _initialState, ...publicSummary } = this.summary();
+    const { scramble: _scramble, initialState: _initialState, ownerId: _ownerId, ...publicSummary } = this.summary();
     return publicSummary;
   }
 
@@ -935,7 +949,10 @@ export class Run {
     await Promise.allSettled(this.contestants.map((c) => c.start()));
     this.status = 'finished';
     this.finishedAt = new Date().toISOString();
-    await saveRun(this.reportRecord()).catch((e) => console.error('保存评测记录失败：', (e as Error).message));
+    await saveRun(this.reportRecord()).catch((e) => {
+      this.reportIncomplete = true;
+      console.error('评测报告未完整保存：', (e as Error).message);
+    });
     this.emit({ type: 'done', run: this.publicSummary() });
     this.doneEmitted = true;
     this.listeners.clear();

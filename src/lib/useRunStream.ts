@@ -61,6 +61,7 @@ function reducer(view: RunView, a: Action): RunView {
   if (a.type === 'hydrate') return { ...fromRecord(a.record), reconnect: view.reconnect };
   if (a.type === 'connection') return { ...view, connection: a.state };
   const e = a.e;
+  if (e.type === 'reset') return view;
   if (e.type === 'init' || e.type === 'done') {
     const cs = { ...view.cs };
     for (const c of e.run.contestants) {
@@ -93,7 +94,7 @@ function reducer(view: RunView, a: Action): RunView {
 }
 
 function eventKey(e: RunEvent): string {
-  if (e.type === 'init' || e.type === 'done') return `${e.type}:${e.run.id}:${e.run.finishedAt ?? ''}`;
+  if (e.type === 'init' || e.type === 'done' || e.type === 'reset') return `${e.type}:${e.run.id}:${e.run.finishedAt ?? ''}`;
   if (e.type === 'move') return `move:${e.cid}:${e.index}`;
   if (e.type === 'call') return `call:${e.cid}:${e.item.n}`;
   if (e.type === 'log') return `log:${e.cid}:${e.t}:${e.text}`;
@@ -151,6 +152,7 @@ export function useRunStream(runId: string | null): RunView {
         done = true;
         es.close();
       }
+      if (e.type === 'reset') { recover(); return; }
       dispatch({ type: 'event', e });
     };
     es.onerror = () => {

@@ -76,6 +76,7 @@ export const geminiAdapter: ProtocolAdapter = {
       const reason = json?.promptFeedback?.blockReason;
       throw new ProviderError('parse', reason ? `请求被拦截：${reason}` : '响应中缺少 candidates（该地址可能不是 Gemini 协议）');
     }
+    if (cand.content?.parts != null && !Array.isArray(cand.content.parts)) throw new ProviderError('parse', 'Gemini candidates[0].content.parts 不是数组');
     const parts: any[] = cand.content?.parts ?? [];
     const normalizedParts: any[] = [];
     const toolCalls: ToolCall[] = [];
@@ -83,6 +84,7 @@ export const geminiAdapter: ProtocolAdapter = {
     let text = '';
     const thoughtTexts: string[] = [];
     parts.forEach((p, i) => {
+      if (!p || typeof p !== 'object') throw new ProviderError('parse', 'Gemini content part 不是对象');
       if (p.functionCall) {
         const args = p.functionCall.args;
         const ok = !args || (typeof args === 'object' && !Array.isArray(args));
@@ -101,7 +103,7 @@ export const geminiAdapter: ProtocolAdapter = {
         normalizedParts.push(p);
         if (!p.thought) text += p.text;
         else if (p.text.trim()) thoughtTexts.push(p.text.trim());
-      }
+      } else normalizedParts.push(p);
     });
     const u = json.usageMetadata;
     const candidates = usageNum(u?.candidatesTokenCount);

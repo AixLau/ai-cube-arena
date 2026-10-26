@@ -423,16 +423,19 @@ test('HTTP 供应商接口：移除旧存储接口，环境变量不预置，每
       });
       assert.equal(started.status, 200);
       const { id } = await started.json() as { id: string };
+      const ownerCookie = started.headers.get('set-cookie')!.split(';')[0];
+      const getOwned = (url: string) => fetch(url, { headers: { Cookie: ownerCookie } });
       mock.solution = formatAlg(invertAlg(runs.get(id)!.scramble)).split(' ');
-      const events = await (await fetch(`${origin}/api/runs/${id}/stream`)).text();
+      const events = await (await getOwned(`${origin}/api/runs/${id}/stream`)).text();
       assert.ok(!events.includes(config.apiKey));
       assert.ok(!events.includes('thinking…'), 'SSE 默认不公开原始 reasoning');
-      const publicRecord = await (await fetch(`${origin}/api/runs/${id}`)).json() as Record<string, unknown>;
+      const publicRecord = await (await getOwned(`${origin}/api/runs/${id}`)).json() as Record<string, unknown>;
       assert.equal('scramble' in publicRecord, false);
       assert.equal('initialState' in publicRecord, false);
-      const privateReport = await (await fetch(`${origin}/api/runs/${id}/report`)).json() as Record<string, unknown>;
+      assert.equal((await fetch(`${origin}/api/runs/${id}/report`)).status, 404, '没有 owner cookie 不能读取私有报告');
+      const privateReport = await (await getOwned(`${origin}/api/runs/${id}/report`)).json() as Record<string, unknown>;
       assert.equal(typeof privateReport.scramble, 'string');
-      const exported = await (await fetch(`${origin}/api/runs/${id}/export`)).json() as {
+      const exported = await (await getOwned(`${origin}/api/runs/${id}/export`)).json() as {
         contestants: { status: string }[];
       };
       assert.equal(exported.contestants[0].status, 'solved');

@@ -23,7 +23,7 @@ const get = (url: string, headers: Record<string, string> = {}) => new Promise<{
 });
 
 test('SSE：事件序号、回放和 Last-Event-ID 不丢失终态', async (t) => {
-  const run = new Run([], { id: 'custom', name: '测试', scrambleLength: 1 }, DEFAULT_LIMITS);
+  const run = new Run([], { id: 'custom', name: '测试', scrambleLength: 1 }, DEFAULT_LIMITS, 3, 'sse-owner');
   runs.set(run.id, run);
   const server = http.createServer(app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -33,7 +33,7 @@ test('SSE：事件序号、回放和 Last-Event-ID 不丢失终态', async (t) =
   });
   const address = server.address() as { port: number };
   const url = `http://127.0.0.1:${address.port}/api/runs/${run.id}/stream`;
-  const firstRequest = get(url);
+  const firstRequest = get(url, { Cookie: 'cube_arena_owner=sse-owner' });
   await run.start();
   const first = await firstRequest;
   assert.equal(first.status, 200);
@@ -44,7 +44,7 @@ test('SSE：事件序号、回放和 Last-Event-ID 不丢失终态', async (t) =
   assert.equal((run as any).listeners.size, 0, '已完成 run 回放 done 后不应残留 listener');
   assert.match(first.body, /"event":\{"type":"done"/);
 
-  const replay = await get(url, { 'Last-Event-ID': '1' });
+  const replay = await get(url, { Cookie: 'cube_arena_owner=sse-owner', 'Last-Event-ID': '1' });
   const replayIds = [...replay.body.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]));
   assert.deepEqual(replayIds, [2]);
   assert.match(replay.body, /"type":"done"/);

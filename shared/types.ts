@@ -274,6 +274,8 @@ export type TraceItem =
 
 export interface RunSummary {
   id: string;
+  /** 服务端私有归属标识；不出现在 PublicRunSummary。 */
+  ownerId?: string;
   createdAt: string;
   difficulty: string;
   /** 魔方阶数；旧记录没有该字段，视为 3 */
@@ -281,6 +283,8 @@ export interface RunSummary {
   /** 打乱步数；旧记录用 scrambleLengthOf 换算 */
   scrambleLength?: number;
   finishedAt?: string;
+  /** 报告因容量限制未完整持久化。 */
+  reportIncomplete?: boolean;
   scramble: string;
   /** 6×N×N 个字符，URFDLB 顺序 */
   initialState: string;
@@ -294,7 +298,7 @@ export interface RunRecord extends RunSummary {
 }
 
 /** 运行中的公开摘要：不包含可直接泄露题目的 scramble 和初始面状态。 */
-export type PublicRunSummary = Omit<RunSummary, 'scramble' | 'initialState'>;
+export type PublicRunSummary = Omit<RunSummary, 'scramble' | 'initialState' | 'ownerId'>;
 
 export type CallTrace = Extract<TraceItem, { type: 'call' }>;
 export type PublicCallTrace = Omit<CallTrace, 'reasoning'>;
@@ -306,6 +310,7 @@ export interface PublicRunRecord extends PublicRunSummary {
 
 export type RunEvent =
   | { type: 'init'; run: PublicRunSummary }
+  | { type: 'reset'; run: PublicRunSummary; minSeq: number; latestSeq: number }
   | { type: 'status'; cid: string; status: ContestantStatus; reason: string | null; t: number }
   | { type: 'move'; cid: string; move: string; index: number; t: number }
   | { type: 'call'; cid: string; item: Extract<TraceItem, { type: 'call' }> }

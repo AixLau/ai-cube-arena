@@ -56,6 +56,7 @@ export const anthropicAdapter: ProtocolAdapter = {
     let text = '';
     const thoughts: string[] = [];
     for (const b of json.content) {
+      if (!b || typeof b !== 'object') throw new ProviderError('parse', 'Anthropic content block 不是对象');
       if (b.type === 'tool_use') {
         const ok = b.input && typeof b.input === 'object' && !Array.isArray(b.input);
         const name = normalizeToolName(b.name, allowedTools);
