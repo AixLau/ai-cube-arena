@@ -1,22 +1,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
 // 测试数据写入临时目录，必须在导入服务端模块之前设置
 process.env.DATA_DIR = mkdtempSync(path.join(os.tmpdir(), 'cube-arena-test-'));
-delete process.env.DEEPSEEK_API_KEY;
 
 const { resolveEndpoint } = await import('../shared/endpoint.ts');
 const { assertAllowedUrl, isBlockedIp, safeLookup } = await import('./security/url.ts');
 const { redact } = await import('./security/redact.ts');
-const { createConfig, listConfigs, getApiKey, duplicateConfig } = await import('./providers/store.ts');
+const { normalizeProvider, refreshProvider } = await import('./providers/store.ts');
 const { testConnection } = await import('./providers/test.ts');
-const { Run } = await import('./arena/run.ts');
+const { Run, runs } = await import('./arena/run.ts');
 const { DIFFICULTIES, DEFAULT_LIMITS } = await import('../shared/types.ts');
-const { invertAlg, formatAlg } = await import('../shared/cube.ts');
+const { invertAlg, formatAlg, parseAlg, applyMoves, solvedState } = await import('../shared/cube.ts');
+const { rotateCubeTool, turnMessage } = await import('./arena/prompt.ts');
 
 const withEnv = async (vars: Record<string, string | undefined>, fn: () => unknown) => {
   const old = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
@@ -88,6 +89,21 @@ const server = http.createServer((req, res) => {
     if (url.startsWith('/nochoice/') && body.tool_choice === 'required') {
       return json(400, { error: { message: "tool_choice 'required' is not supported by this model" } });
     }
+    if (url.startsWith('/notoolloop/') && url.endsWith('/chat/completions')) {
+      return json(200, { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: '我还在思考' } }] });
+    }
+    // planner：第一次只执行解法的第一步，把剩余步骤写进 plan；之后执行剩余步骤
+    if (url.startsWith('/planner/') && body.tools?.[0]?.function?.name === 'rotate_cube') {
+      const first = mock.calls.filter((c) => c.path === url).length === 1;
+      const args = first ? { moves: mock.solution.slice(0, 1), plan: `接下来：${mock.solution.slice(1).join(' ')}` } : { moves: mock.solution.slice(1) };
+      return json(200, {
+        choices: [{
+          finish_reason: 'tool_calls',
+          message: { role: 'assistant', content: null, tool_calls: [{ id: `p${mock.calls.length}`, type: 'function', function: { name: 'rotate_cube', arguments: JSON.stringify(args) } }] },
+        }],
+        usage: { prompt_tokens: 100, completion_tokens: 50 },
+      });
+    }
     // chatty / nochoice：第一次请求只回复文字（chatty 的输出还被截断），思考写在 reasoning_content 与 <think> 中
     if ((url.startsWith('/chatty/') || url.startsWith('/nochoice/')) && mock.calls.filter((c) => c.path === url).length === 1) {
       return json(200, {
@@ -118,6 +134,28 @@ const server = http.createServer((req, res) => {
           },
         }],
         ...(noUsage ? {} : { usage: { prompt_tokens: 100, completion_tokens: 50, completion_tokens_details: { reasoning_tokens: 20 }, cost: 0.001 } }),
+      });
+    }
+    if (url.startsWith('/responses-legacy/') && url.endsWith('/responses')) {
+      if (body.include || body.reasoning?.summary) {
+        return json(400, { error: { message: 'Unknown field include or reasoning.summary' } });
+      }
+      return json(200, {
+        status: 'completed',
+        output: [{ type: 'function_call', id: 'legacy_fc', call_id: 'legacy_call', name: 'rotate_cube', arguments: JSON.stringify({ moves }) }],
+        usage: { input_tokens: 80, output_tokens: 30, output_tokens_details: { reasoning_tokens: 5 } },
+      });
+    }
+    if (url.startsWith('/responses-memory/') && url.endsWith('/responses')) {
+      const callNo = mock.calls.filter((c) => c.path === url).length;
+      const responseMoves = callNo === 1 ? moves.slice(0, 1) : moves.slice(1);
+      return json(200, {
+        status: 'completed',
+        output: [
+          { type: 'reasoning', id: `rs_${callNo}`, summary: [{ type: 'summary_text', text: '推理摘要' }], content: [{ type: 'reasoning_text', text: '隐藏上下文' }], encrypted_content: 'encrypted-reasoning' },
+          { type: 'function_call', id: `fc_${callNo}`, phase: 'commentary', call_id: `call_${callNo}`, name: 'rotate_cube', arguments: JSON.stringify({ moves: responseMoves }) },
+        ],
+        usage: { input_tokens: 80, output_tokens: 30, output_tokens_details: { reasoning_tokens: 5 } },
       });
     }
     if (url.endsWith('/responses')) {
@@ -210,20 +248,105 @@ const draft = (over: Record<string, unknown>) => ({
 // 测试用的短打乱：模拟供应商一次性给出全部解法，需在单次步数上限内
 const D3 = { id: 'custom', name: '3', scrambleLength: 3 };
 const D6 = { id: 'custom', name: '6', scrambleLength: 6 };
-const E = (config: any, reasoningEffort: any = 'default', model = 'mock-model') => ({ config, model, reasoningEffort });
+const E = (config: any, reasoningEffort: any = 'default', model = 'mock-model') => ({ config, apiKey: 'sk-test-1234567890abcdef', model, reasoningEffort });
 
-test('配置存储：密钥默认只在内存，接口不回传，环境预置复制不带密钥', async () => {
-  const cfg = await createConfig(draft({}));
-  assert.equal(cfg.keySource, 'memory');
-  assert.ok(!JSON.stringify(await listConfigs()).includes('sk-test-1234567890abcdef'));
-  assert.equal(await getApiKey(cfg.id), 'sk-test-1234567890abcdef');
-  const copy = await duplicateConfig(cfg.id);
-  assert.equal(await getApiKey(copy.id), 'sk-test-1234567890abcdef');
-  await assert.rejects(createConfig(draft({ persistKey: true })), /CREDENTIAL_SECRET/);
+async function makeProvider(over: Record<string, unknown> = {}) {
+  const { apiKey, ...config } = draft(over);
+  return refreshProvider({ ...config, id: randomUUID() }, apiKey);
+}
+
+test('供应商请求无状态：密钥不回传、不落盘、不复用之前请求的密钥', async () => {
+  const input = { ...draft({}), id: randomUUID() };
+  const cfg = await refreshProvider(input, input.apiKey);
+  assert.equal(cfg.keySource, 'browser');
+  assert.ok(!JSON.stringify(cfg).includes(input.apiKey));
+  assert.ok(!('apiKey' in cfg));
+  const withoutKey = await refreshProvider(input, undefined);
+  assert.equal(withoutKey.keySource, 'none');
+  assert.match(withoutKey.modelsError ?? '', /API Key/);
+  assert.equal(existsSync(path.join(process.env.DATA_DIR!, 'providers.json')), false);
+  assert.equal(existsSync(path.join(process.env.DATA_DIR!, 'credentials.json')), false);
+});
+
+test('供应商校验保留最多 1000 个自动模型，拒绝无效地址、并发和密钥', async () => {
+  const models = Array.from({ length: 1000 }, (_, i) => `model-${i}`);
+  const input = { ...draft({}), id: randomUUID(), models };
+  assert.deepEqual(normalizeProvider(input).models, models);
+  assert.throws(() => normalizeProvider({ ...input, maxConcurrentRequests: 0 }), /并发/);
+  assert.throws(() => normalizeProvider({ ...input, baseUrl: 'ftp://example.com' }), /HTTPS|协议/);
+  await assert.rejects(refreshProvider(input, 'invalid key'), /API Key/);
+});
+
+test('HTTP 供应商接口：移除旧存储接口，环境变量不预置，每次请求必须携带配置和密钥', async (t) => {
+  const { app } = await import('./index.ts');
+  const listener = app.listen(0, '127.0.0.1');
+  await new Promise<void>((resolve) => listener.once('listening', resolve));
+  t.after(() => new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve())));
+  const origin = `http://127.0.0.1:${(listener.address() as { port: number }).port}`;
+  const post = (url: string, body: unknown) => fetch(`${origin}${url}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+
+  await withEnv({ DEEPSEEK_API_KEY: 'server-secret-must-not-be-used' }, async () => {
+    assert.equal((await fetch(`${origin}/api/providers`)).status, 404);
+    assert.equal((await post('/api/providers', draft({}))).status, 404);
+    assert.equal((await post('/api/providers/legacy/duplicate', {})).status, 404);
+    const meta = await (await fetch(`${origin}/api/meta`)).json() as Record<string, unknown>;
+    assert.ok(!('encryptionAvailable' in meta));
+    assert.ok(!JSON.stringify(meta).includes('server-secret'));
+
+    const config = { ...draft({}), id: 'env-deepseek' };
+    const refreshed = await post('/api/providers/refresh-models', { config, apiKey: config.apiKey });
+    assert.equal(refreshed.status, 200);
+    const result = await refreshed.json() as Record<string, unknown>;
+    assert.ok(!JSON.stringify(result).includes(config.apiKey));
+    assert.equal(refreshed.headers.get('cache-control'), 'no-store');
+    const largeConfig = {
+      ...config, models: Array.from({ length: 1000 }, (_, i) => `model-${i}-${'x'.repeat(120)}`),
+    };
+    assert.equal((await post('/api/providers/refresh-models', { config: largeConfig, apiKey: config.apiKey })).status, 200);
+
+    const unkeyed = await post('/api/providers/refresh-models', { config });
+    const withoutKey = await unkeyed.json() as { keySource: string; modelsError: string };
+    assert.equal(withoutKey.keySource, 'none');
+    assert.match(withoutKey.modelsError, /API Key/);
+
+    const connected = await post('/api/providers/test', { config, apiKey: config.apiKey, model: 'mock-model' });
+    assert.equal((await connected.json() as { ok: boolean }).ok, true);
+    const disconnected = await post('/api/providers/test', { config, model: 'mock-model' });
+    assert.equal((await disconnected.json() as { ok: boolean }).ok, false);
+
+    const runBody = { entries: [{ providerId: config.id, model: 'mock-model' }], scrambleLength: 3 };
+    assert.equal((await post('/api/runs', runBody)).status, 400);
+    assert.equal((await post('/api/runs', { ...runBody, providers: [{ config: { ...config, models: ['mock-model'] } }] })).status, 400);
+    assert.equal((await post('/api/runs', { ...runBody, providers: [null] })).status, 400);
+
+    mock.delayMs = 50;
+    try {
+      const started = await post('/api/runs', {
+        ...runBody, providers: [{ config: { ...config, models: ['mock-model'] }, apiKey: config.apiKey }],
+      });
+      assert.equal(started.status, 200);
+      const { id } = await started.json() as { id: string };
+      mock.solution = formatAlg(invertAlg(runs.get(id)!.scramble)).split(' ');
+      const events = await (await fetch(`${origin}/api/runs/${id}/stream`)).text();
+      assert.ok(!events.includes(config.apiKey));
+      const exported = await (await fetch(`${origin}/api/runs/${id}/export`)).json() as {
+        contestants: { status: string }[];
+      };
+      assert.equal(exported.contestants[0].status, 'solved');
+      assert.ok(!JSON.stringify(exported).includes(config.apiKey));
+      assert.ok(!JSON.stringify(exported).includes('baseUrl'));
+    } finally {
+      mock.delayMs = 0;
+    }
+  });
+  assert.equal(existsSync(path.join(process.env.DATA_DIR!, 'providers.json')), false);
+  assert.equal(existsSync(path.join(process.env.DATA_DIR!, 'credentials.json')), false);
 });
 
 test('测试连接：成功、工具支持、401 脱敏、重定向拒绝、不支持工具', async () => {
-  const mk = (p: string) => ({ ...draft({ baseUrl: `${base}${p}` }), id: 'x', keySource: 'memory', createdAt: '', updatedAt: '' });
+  const mk = (p: string) => ({ ...draft({ baseUrl: `${base}${p}` }), id: 'x', keySource: 'browser', createdAt: '', updatedAt: '' });
   const ok = await testConnection(mk('/v1'), 'sk-test-1234567890abcdef', 'mock-model');
   assert.equal(ok.ok, true);
   assert.equal(ok.toolSupport, 'supported');
@@ -240,13 +363,13 @@ test('测试连接：成功、工具支持、401 脱敏、重定向拒绝、不�
 
 test('多模型同题评测：同一初始状态、独立状态、真正并发、失败隔离、Token 口径', async () => {
   const configs = [
-    await createConfig(draft({ name: 'chat' })),
-    await createConfig(draft({ name: 'responses', protocol: 'openai-responses' })),
-    await createConfig(draft({ name: 'anthropic', protocol: 'anthropic', baseUrl: base, authMode: 'x-api-key' })),
-    await createConfig(draft({ name: 'gemini', protocol: 'gemini', baseUrl: `${base}/v1beta`, authMode: 'x-goog-api-key' })),
-    await createConfig(draft({ name: 'bad', baseUrl: `${base}/bad/v1` })),
-    await createConfig(draft({ name: 'nousage', baseUrl: `${base}/nousage/v1` })),
-    await createConfig(draft({ name: 'wrong', baseUrl: `${base}/wrong/v1` })),
+    await makeProvider({ name: 'chat' }),
+    await makeProvider({ name: 'responses', protocol: 'openai-responses' }),
+    await makeProvider({ name: 'anthropic', protocol: 'anthropic', baseUrl: base, authMode: 'x-api-key' }),
+    await makeProvider({ name: 'gemini', protocol: 'gemini', baseUrl: `${base}/v1beta`, authMode: 'x-goog-api-key' }),
+    await makeProvider({ name: 'bad', baseUrl: `${base}/bad/v1` }),
+    await makeProvider({ name: 'nousage', baseUrl: `${base}/nousage/v1` }),
+    await makeProvider({ name: 'wrong', baseUrl: `${base}/wrong/v1` }),
   ];
   mock.calls = [];
   mock.delayMs = 300;
@@ -297,24 +420,35 @@ test('多模型同题评测：同一初始状态、独立状态、真正并发�
   for (const c of mock.calls) assert.ok(!JSON.stringify(c.body).includes(scramble), '请求中不应出现打乱公式');
   // 请求中不出现其它选手或服务端的密钥以外的内容：Authorization 正确
   assert.equal(first[0].headers.authorization, 'Bearer sk-test-1234567890abcdef');
-  // 每次请求只携带最新状态，不回放会造成 Token 线性累加的历史消息
+  // 只回放上一轮交互，不能把完整对话历史按轮次累加
   const wrongCalls = mock.calls.filter((c) => c.path.startsWith('/wrong/') && c.path.endsWith('/chat/completions'));
   assert.ok(wrongCalls.length >= 2);
-  assert.ok(wrongCalls.every((c) => c.body.messages.filter((m: any) => m.role === 'assistant' || m.role === 'tool').length === 0));
-  assert.ok(wrongCalls[1].body.messages[1].content.includes('上一轮工具执行摘要'));
+  assert.ok(wrongCalls.every((c) => {
+    const history = c.body.messages.filter((m: any) => m.role === 'assistant' || m.role === 'tool');
+    return history.length <= 2 && c.body.messages.length <= 5;
+  }));
+  assert.match(wrongCalls[1].body.messages.at(-1).content, /最近的调用[\s\S]*#1 未执行：非法记号/);
   // 事件中不出现密钥
   assert.ok(!JSON.stringify(run.events).includes('sk-test-1234567890abcdef'));
+  const persisted = readFileSync(path.join(process.env.DATA_DIR!, 'runs', `${run.id}.json`), 'utf8');
+  assert.ok(!persisted.includes('sk-test-1234567890abcdef'));
+  assert.ok(!persisted.includes('baseUrl'));
+  for (const c of run.contestants) {
+    const transient = c as unknown as { config?: unknown; apiKey?: unknown };
+    assert.equal(transient.config, undefined, '评测结束后不保留供应商配置');
+    assert.equal(transient.apiKey, undefined, '评测结束后不保留 API Key');
+  }
   mock.delayMs = 0;
 });
 
-test('移除统一并发限制后，单个模型可停止且不影响其它', async () => {
-  const configs = [await createConfig(draft({ name: 'a' })), await createConfig(draft({ name: 'b' }))];
+test('单局并发限制下，单个模型可停止且不影响其它', async () => {
+  const configs = [await makeProvider({ name: 'a' }), await makeProvider({ name: 'b' })];
   mock.delayMs = 200;
   const run = new Run(configs.map((c) => E(c)), D3, { ...DEFAULT_LIMITS, concurrency: 1 });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
   const done = run.start();
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(run.contestants[1].status, 'running');
+  assert.equal(run.contestants[1].status, 'queued');
   run.contestants[0].stop();
   await done;
   assert.equal(run.contestants[0].status, 'stopped');
@@ -326,8 +460,8 @@ test('限流：429 按 Retry-After 重试且不计入调用预算；同一密钥
   // 3 个配置共用同一密钥与地址，上限 1 个并发请求
   const shared = [1, 2, 3].map((i) => draft({ name: `limited-${i}`, baseUrl: `${base}/limited/v1`, maxConcurrentRequests: 1 }));
   const configs = [];
-  for (const d of shared) configs.push(await createConfig(d));
-  const throttled = await createConfig(draft({ name: 'throttled', baseUrl: `${base}/throttle/v1` }));
+  for (const d of shared) configs.push(await makeProvider(d));
+  const throttled = await makeProvider({ name: 'throttled', baseUrl: `${base}/throttle/v1` });
   mock.delayMs = 150;
   maxInFlight = 0;
   throttleLeft = 2;
@@ -344,7 +478,7 @@ test('限流：429 按 Retry-After 重试且不计入调用预算；同一密钥
 });
 
 test('不限制总旋转次数：超过 200 步后仍可继续并复原', async () => {
-  const cfg = await createConfig(draft({ name: 'spin', baseUrl: `${base}/spin/v1` }));
+  const cfg = await makeProvider({ name: 'spin', baseUrl: `${base}/spin/v1` });
   const run = new Run([E(cfg)], D6, { ...DEFAULT_LIMITS, maxApiCalls: 40, concurrency: 1 });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
   await run.start();
@@ -352,23 +486,26 @@ test('不限制总旋转次数：超过 200 步后仍可继续并复原', async 
   assert.equal(c.status, 'solved');
   assert.equal(c.stats.moves, 260 + mock.solution.length);
   const spinCalls = mock.calls.filter((x) => x.path.startsWith('/spin/') && x.path.endsWith('/chat/completions'));
-  assert.ok(spinCalls.every((x) => x.body.messages.length === 2), '长评测不能回放完整对话历史');
+  assert.ok(spinCalls.every((x) => {
+    const history = x.body.messages.filter((m: any) => m.role === 'assistant' || m.role === 'tool');
+    return history.length <= 2 && x.body.messages.length <= 5;
+  }), '长评测不能回放完整对话历史');
 });
 
 test('供应商：保存后自动获取模型列表；不支持列表时可手动补充', async () => {
-  const cfg = await createConfig(draft({ name: undefined }));
+  const cfg = await makeProvider({ name: undefined });
   assert.deepEqual(cfg.models, ['mock-2', 'mock-model']);
   assert.equal(cfg.modelsError, null);
   assert.equal(cfg.name, new URL(base).host, '名称默认使用域名');
-  const nolist = await createConfig(draft({ baseUrl: `${base}/nolist/v1`, manualModels: ['my-model'] }));
+  const nolist = await makeProvider({ baseUrl: `${base}/nolist/v1`, manualModels: ['my-model'] });
   assert.deepEqual(nolist.models, []);
   assert.match(nolist.modelsError ?? '', /手动/);
   assert.deepEqual(nolist.manualModels, ['my-model']);
 });
 
 test('推理强度：按协议发送参数；模型拒绝时去掉参数重试并标记', async () => {
-  const ok = await createConfig(draft({ name: 'effort' }));
-  const rejecting = await createConfig(draft({ name: 'noeffort', baseUrl: `${base}/noeffort/v1` }));
+  const ok = await makeProvider({ name: 'effort' });
+  const rejecting = await makeProvider({ name: 'noeffort', baseUrl: `${base}/noeffort/v1` });
   mock.calls = [];
   const run = new Run([E(ok, 'high'), E(rejecting, 'low'), E(ok, 'default', 'mock-2')], D3, { ...DEFAULT_LIMITS, concurrency: 4 });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
@@ -383,7 +520,7 @@ test('推理强度：按协议发送参数；模型拒绝时去掉参数重试�
 });
 
 test('多阶魔方：4 阶与 2 阶同题评测，提示词说明阶数，初始状态为 6×N×N', async () => {
-  const cfg = await createConfig(draft({ name: 'nxn' }));
+  const cfg = await makeProvider({ name: 'nxn' });
   for (const n of [2, 4]) {
     mock.calls = [];
     const run = new Run([E(cfg)], D6, { ...DEFAULT_LIMITS, concurrency: 1 }, n);
@@ -397,7 +534,7 @@ test('多阶魔方：4 阶与 2 阶同题评测，提示词说明阶数，初始
 });
 
 test('参数兼容：max_tokens 被拒绝时改用 max_completion_tokens，不误判为推理强度不受支持', async () => {
-  const cfg = await createConfig(draft({ name: 'maxtok', baseUrl: `${base}/maxtok/v1` }));
+  const cfg = await makeProvider({ name: 'maxtok', baseUrl: `${base}/maxtok/v1` });
   mock.calls = [];
   const run = new Run([{ ...E(cfg, 'high'), maxOutputTokens: 512 }], D3, { ...DEFAULT_LIMITS });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
@@ -415,7 +552,7 @@ test('参数兼容：max_tokens 被拒绝时改用 max_completion_tokens，不�
 });
 
 test('未调用工具：下一次强制 tool_choice=required；输出截断时提示模型，思考内容与正文分开记录', async () => {
-  const cfg = await createConfig(draft({ name: 'chatty', baseUrl: `${base}/chatty/v1` }));
+  const cfg = await makeProvider({ name: 'chatty', baseUrl: `${base}/chatty/v1` });
   mock.calls = [];
   const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
@@ -426,7 +563,7 @@ test('未调用工具：下一次强制 tool_choice=required；输出截断时�
   assert.equal(sent.length, 2);
   assert.equal(sent[0].body.tool_choice, 'auto');
   assert.equal(sent[1].body.tool_choice, 'required');
-  assert.match(sent[1].body.messages[1].content, /截断/);
+  assert.match(sent[1].body.messages.at(-1).content, /截断/);
   const first = contestant.trace.find((t) => t.type === 'call') as any;
   assert.equal(first.text, '我来分析一下');
   assert.equal(first.reasoning, '观察展开图\n\n先看 U 面');
@@ -435,7 +572,7 @@ test('未调用工具：下一次强制 tool_choice=required；输出截断时�
 });
 
 test('强制工具调用被拒绝：回退为 auto 继续，不误判为推理强度不受支持', async () => {
-  const cfg = await createConfig(draft({ name: 'nochoice', baseUrl: `${base}/nochoice/v1` }));
+  const cfg = await makeProvider({ name: 'nochoice', baseUrl: `${base}/nochoice/v1` });
   mock.calls = [];
   const run = new Run([E(cfg, 'low')], D3, { ...DEFAULT_LIMITS });
   mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
@@ -448,6 +585,142 @@ test('强制工具调用被拒绝：回退为 auto 继续，不误判为推理�
   assert.deepEqual(sent.map((x) => x.body.tool_choice), ['auto', 'required', 'auto']);
   assert.equal(sent[2].body.reasoning_effort, 'low');
   assert.ok(run.contestants[0].trace.some((t) => t.type === 'log' && /强制工具调用/.test(t.text)));
+});
+
+test('每轮记忆：模型记下的计划与最近调用的效果带到下一轮，只回放上一轮交互', async () => {
+  const cfg = await makeProvider({ name: 'planner', baseUrl: `${base}/planner/v1` });
+  mock.calls = [];
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  const contestant = run.contestants[0];
+  assert.equal(contestant.status, 'solved');
+  const sent = mock.calls.filter((x) => x.path.startsWith('/planner/'));
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0].body.tools[0].function.parameters.properties.plan.type, 'string');
+  assert.match(sent[0].body.messages[1].content, /还没有记下计划/);
+  const second = sent[1].body.messages;
+  assert.equal(second.length, 5, '只回放上一轮交互，不累加完整历史');
+  assert.equal(second.filter((m: any) => m.role === 'assistant' || m.role === 'tool').length, 2);
+  assert.ok(second.at(-1).content.includes(`最近的调用（从旧到新）：\n#1 ${mock.solution[0]}\n`));
+  assert.ok(!/已归位|变好|变差|撤销/.test(second.at(-1).content), '只给状态与事实，不评价进展');
+  assert.ok(second.at(-1).content.includes(`你在第 1 次调用时记下的计划：接下来：${mock.solution.slice(1).join(' ')}`));
+  const firstCall = contestant.trace.find((t) => t.type === 'call') as any;
+  assert.equal(firstCall.plan, `接下来：${mock.solution.slice(1).join(' ')}`);
+});
+
+test('Responses API：保留一轮工具上下文、原始元数据并请求简洁推理摘要', async () => {
+  const cfg = await makeProvider({ name: 'responses-memory', protocol: 'openai-responses', baseUrl: `${base}/responses-memory/v1` });
+  mock.calls = [];
+  const run = new Run([E(cfg, 'high')], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  assert.equal(run.contestants[0].status, 'solved');
+  const sent = mock.calls.filter((x) => x.path.startsWith('/responses-memory/') && x.path.endsWith('/responses'));
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[0].body.include, ['reasoning.encrypted_content']);
+  assert.deepEqual(sent[0].body.reasoning, { effort: 'high', summary: 'concise' });
+  const input = sent[1].body.input as any[];
+  assert.ok(input.some((x) => x.type === 'reasoning' && x.id === 'rs_1' && x.encrypted_content === 'encrypted-reasoning'));
+  assert.ok(input.some((x) => x.type === 'reasoning' && x.content?.[0]?.text === '隐藏上下文'));
+  assert.ok(input.some((x) => x.type === 'function_call' && x.id === 'fc_1' && x.phase === 'commentary'));
+  const output = input.find((x) => x.type === 'function_call_output');
+  assert.ok(output);
+  assert.match(output.output, /moves_used/);
+  assert.match(output.output, /correct_stickers/);
+  assert.match(output.output, /state/);
+  assert.equal(sent[0].body.parallel_tool_calls, false);
+});
+
+test('Responses API：旧中转拒绝可选推理字段时回退到基础请求', async () => {
+  const cfg = await makeProvider({ name: 'responses-legacy', protocol: 'openai-responses', baseUrl: `${base}/responses-legacy/v1` });
+  mock.calls = [];
+  const run = new Run([E(cfg, 'high')], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  assert.equal(run.contestants[0].status, 'solved');
+  const sent = mock.calls.filter((x) => x.path.startsWith('/responses-legacy/') && x.path.endsWith('/responses'));
+  assert.equal(sent.length, 3, '分别回退 include 与 summary 后再成功');
+  assert.ok(sent[0].body.include);
+  assert.equal(sent[1].body.include, undefined);
+  assert.equal(sent[1].body.reasoning?.summary, 'concise');
+  assert.equal(sent[2].body.include, undefined);
+  assert.deepEqual(sent[2].body.reasoning, { effort: 'high' });
+  assert.equal(run.contestants[0].snapshot().stats.apiCalls, 1, '兼容性重试不应增加评测调用次数');
+});
+
+test('Responses 默认模式不强制发送可选 reasoning 参数', async () => {
+  const cfg = await makeProvider({ name: 'responses-default', protocol: 'openai-responses', baseUrl: `${base}/responses-default/v1` });
+  mock.calls = [];
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  assert.equal(run.contestants[0].status, 'solved');
+  const sent = mock.calls.filter((x) => x.path.startsWith('/responses-default/') && x.path.endsWith('/responses'));
+  assert.equal(sent[0].body.reasoning, undefined);
+  assert.equal(sent[0].body.include, undefined);
+});
+
+test('运行预算：达到 API 调用上限和连续无工具上限时失败', async () => {
+  const cfg = await makeProvider({ name: 'budget', baseUrl: `${base}/spin/v1` });
+  const run = new Run([E(cfg)], D6, { ...DEFAULT_LIMITS, maxApiCalls: 1 });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  assert.equal(run.contestants[0].status, 'failed');
+  assert.match(run.contestants[0].failReason ?? '', /最大 API 调用次数/);
+
+  const chatty = await makeProvider({ name: 'notoolloop', baseUrl: `${base}/notoolloop/v1` });
+  const noToolRun = new Run([E(chatty)], D3, { ...DEFAULT_LIMITS, maxApiCalls: 10 });
+  await noToolRun.start();
+  assert.equal(noToolRun.contestants[0].status, 'failed');
+  assert.match(noToolRun.contestants[0].failReason ?? '', /连续 3 次未调用工具/);
+
+  mock.delayMs = 80;
+  const slow = await makeProvider({ name: 'slow-budget', baseUrl: `${base}/slow-budget/v1` });
+  const durationRun = new Run([E(slow)], D3, { ...DEFAULT_LIMITS, maxDurationSec: 0.02, requestTimeoutSec: 1 });
+  await durationRun.start();
+  assert.equal(durationRun.contestants[0].status, 'failed');
+  assert.match(durationRun.contestants[0].failReason ?? '', /最大运行时间/);
+  mock.delayMs = 0;
+});
+
+test('单局 concurrency 限制实际控制 in-flight 请求数', async () => {
+  const configs = await Promise.all([1, 2, 3, 4].map((i) => makeProvider({ name: `run-limit-${i}`, baseUrl: `${base}/limited/v1` })));
+  mock.calls = [];
+  mock.delayMs = 80;
+  maxInFlight = 0;
+  const run = new Run(configs.map((c) => E(c)), D3, { ...DEFAULT_LIMITS, concurrency: 2 });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  assert.equal(maxInFlight, 2);
+  for (const c of run.contestants) assert.equal(c.status, 'solved');
+  mock.delayMs = 0;
+});
+
+test('工具契约按魔方阶数和单次动作上限生成 schema', () => {
+  const tool = rotateCubeTool({ ...DEFAULT_LIMITS, maxMovesPerCall: 3 }, 4);
+  assert.match(tool.description, /4x4x4/);
+  const moves = tool.parameters.properties as any;
+  assert.equal(moves.moves.minItems, 1);
+  assert.equal(moves.moves.maxItems, 3);
+  assert.equal(moves.moves.items.enum.length, 18);
+});
+
+test('每轮记忆：只给当前状态、最近执行的动作和模型自己的计划，不评价进展', () => {
+  const state = applyMoves(solvedState(3), parseAlg('R U'));
+  const first = turnMessage(state, { recent: [], plan: null });
+  assert.ok(first.includes('展开图：') && first.includes('逐面格子：'));
+  assert.ok(!first.includes('最近的调用'));
+  const msg = turnMessage(state, {
+    recent: [{ n: 3, moves: ['F'] }, { n: 4, moves: ['U2', 'R', 'U', "R'"] }, { n: 5, moves: [], error: '非法记号：X，整次调用未执行' }],
+    plan: { n: 4, text: '插入 DFR 角块' },
+  });
+  assert.ok(msg.includes("最近的调用（从旧到新）：\n#3 F\n#4 U2 R U R'\n#5 未执行：非法记号：X，整次调用未执行"));
+  assert.ok(msg.includes('你在第 4 次调用时记下的计划：插入 DFR 角块'));
+  assert.ok(!/已归位|变好|变差|撤销/.test(msg), '不告诉模型变好还是变差');
+  const noTool = turnMessage(state, { recent: [{ n: 2, moves: [], error: '未调用工具' }], plan: null, notes: ['请调用工具'] });
+  assert.ok(noTool.includes('#2 未执行：未调用工具'));
+  assert.ok(noTool.includes('请调用工具'));
 });
 
 test.after(() => server.close());

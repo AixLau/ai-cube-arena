@@ -10,10 +10,12 @@ import {
 } from '../../shared/types.ts';
 import { ADAPTERS } from '../adapters/index.ts';
 import { ProviderError } from '../adapters/http.ts';
-import { getApiKey } from '../providers/store.ts';
 import type { ToolCall, Turn, TurnResult } from '../adapters/types.ts';
 import { redact } from '../security/redact.ts';
-import { describeState, initialUserMessage, NO_TOOL_NUDGE, rotateCubeTool, systemPrompt, TRUNCATED_NOTE } from './prompt.ts';
+import {
+  describeState, MAX_PLAN_CHARS, NO_TOOL_NUDGE, RECENT_CALLS_SHOWN, rotateCubeTool, systemPrompt, TRUNCATED_NOTE, turnMessage,
+  type CallRecap, type TurnMemory,
+} from './prompt.ts';
 import { saveRun } from './store.ts';
 
 /** 简单的计数信号量，用于单局并发与全局并发控制 */
@@ -90,6 +92,7 @@ function clipMiddle(s: string, max: number): string {
 
 export interface ContestantEntry {
   config: ProviderConfig;
+  apiKey?: string;
   model: string;
   reasoningEffort: ReasoningEffort;
   maxOutputTokens?: number | null;
@@ -117,9 +120,10 @@ export class Contestant {
   private resumeWaiters: (() => void)[] = [];
   private activeSince: number | null = null;
 
-  private readonly config: ProviderConfig;
+  private config: ProviderConfig | undefined;
   private readonly model: string;
   private readonly maxOutputTokens: number | null;
+  private apiKey: string | undefined;
   /** 推理强度；被模型拒绝后降级为 default 继续 */
   private effort: ReasoningEffort;
 
@@ -131,6 +135,7 @@ export class Contestant {
     this.model = entry.model;
     this.effort = entry.reasoningEffort;
     this.maxOutputTokens = entry.maxOutputTokens ?? null;
+    this.apiKey = entry.apiKey;
     this.state = run.initialState;
     this.stats = emptyStats(this.state);
     const endpoint = resolveEndpoint(this.config.protocol, this.config.baseUrl, this.model);
@@ -142,6 +147,7 @@ export class Contestant {
       host: hostOf(endpoint),
       model: this.model,
       reasoningEffort: entry.reasoningEffort,
+      maxOutputTokens: this.maxOutputTokens,
     };
   }
 
@@ -236,19 +242,24 @@ export class Contestant {
     if (u?.cost != null) s.cost = (s.cost ?? 0) + u.cost;
   }
 
-  /** 执行一次 rotate_cube 调用，返回给模型的工具结果 */
+  /** 执行一次 rotate_cube 调用，返回给模型的完整结构化工具结果 */
   private async executeTool(call: ToolCall): Promise<{ content: string; moves: string[]; ok: boolean; error?: string }> {
+    const stateResult = () => {
+      const s = describeState(this.state);
+      return { moves_used: this.stats.moves, correct_stickers: `${s.correct}/${s.total}`, state: { net: s.net, faces: s.faces } };
+    };
     const reject = (error: string) => {
       this.stats.invalidToolCalls++;
-      return { content: JSON.stringify({ ok: false, error, executed: [] }), moves: [], ok: false, error };
+      return { content: JSON.stringify({ ok: false, error, executed: [], ...stateResult() }), moves: [], ok: false, error };
     };
     if (call.name !== 'rotate_cube') return reject(`未知工具 ${call.name}，只能调用 rotate_cube`);
     if (!call.args) return reject(call.argsError ?? '工具参数无法解析');
     const raw = (call.args as { moves?: unknown }).moves;
     const tokens = Array.isArray(raw) ? raw.map(String) : typeof raw === 'string' ? raw.split(/[\s,]+/).filter(Boolean) : null;
     if (!tokens || !tokens.length) return reject('moves 必须是非空数组，例如 ["R", "U\'"]');
-    const { limits } = this.run;
-    if (tokens.length > limits.maxMovesPerCall) return reject(`单次最多 ${limits.maxMovesPerCall} 步，本次 ${tokens.length} 步，已拒绝`);
+    if (tokens.length > this.run.limits.maxMovesPerCall) {
+      return reject(`单次最多 ${this.run.limits.maxMovesPerCall} 步，本次 ${tokens.length} 步，已拒绝`);
+    }
     const moves = tokens.map((t) => parseMove(t));
     const bad = tokens.filter((_, i) => !moves[i]);
     if (bad.length) return reject(`非法记号：${bad.join(' ')}，整次调用未执行`);
@@ -284,25 +295,32 @@ export class Contestant {
     };
   }
 
-  /**
-   * 每次模型请求都从当前状态重新开始一轮短上下文。
-   * 魔方状态已经包含此前所有动作的结果，继续回放 assistant 的
-   * reasoning_content / tool_calls 会让供应商在每轮重复计费整段历史。
-   */
-  private stateTurn(feedback = ''): Turn {
-    const text = feedback ? `${initialUserMessage(this.state)}\n\n${feedback}` : initialUserMessage(this.state);
-    return { role: 'user', text };
+  /** 当前状态是事实来源；调用循环只回放上一轮协议交互，避免历史线性增长。 */
+  private stateTurn(memory: TurnMemory): Turn {
+    return { role: 'user', text: turnMessage(this.state, memory) };
   }
 
   async start() {
-    const acquired = (await this.run.slots.acquire(this.abort.signal)) && (await globalSessions.acquire(this.abort.signal));
-    if (!acquired) {
+    const runAcquired = await this.run.slots.acquire(this.abort.signal);
+    if (!runAcquired) {
       this.setStatus('stopped', this.failReason ?? '排队时被停止');
+      this.config = undefined;
+      this.apiKey = undefined;
+      return;
+    }
+    const globalAcquired = await globalSessions.acquire(this.abort.signal);
+    if (!globalAcquired) {
+      this.run.slots.release();
+      this.setStatus('stopped', this.failReason ?? '排队时被停止');
+      this.config = undefined;
+      this.apiKey = undefined;
       return;
     }
     try {
       await this.loop();
     } finally {
+      this.config = undefined;
+      this.apiKey = undefined;
       this.run.slots.release();
       globalSessions.release();
     }
@@ -311,27 +329,59 @@ export class Contestant {
   private async loop() {
     const { limits } = this.run;
     this.setStatus('running');
-    const apiKey = await getApiKey(this.config.id);
-    if (!apiKey && this.config.authMode !== 'none') {
-      this.setStatus('error', '未设置 API Key（服务重启后，未加密保存的密钥需要重新输入）');
+    const config = this.config!;
+    const apiKey = this.apiKey;
+    if (!apiKey && config.authMode !== 'none') {
+      this.setStatus('error', '未设置 API Key');
       return;
     }
-    const adapter = ADAPTERS[this.config.protocol];
-    const endpoint = resolveEndpoint(this.config.protocol, this.config.baseUrl, this.model);
-    const tools = [rotateCubeTool(limits)];
+    const adapter = ADAPTERS[config.protocol];
+    const endpoint = resolveEndpoint(config.protocol, config.baseUrl, this.model);
+    const tools = [rotateCubeTool(limits, this.run.cubeSize)];
     const system = systemPrompt(limits, this.run.cubeSize);
-    // 不把上一轮的 assistant/tool 历史带回供应商；当前状态是完整事实来源。
-    let turns: Turn[] = [this.stateTurn()];
+    // 只保留上一轮交互，避免完整历史线性增长，同时让推理模型能沿用刚完成的工具调用上下文。
+    const recent: CallRecap[] = [];
+    let plan: TurnMemory['plan'] = null;
+    const remember = (r: CallRecap) => {
+      recent.push(r);
+      if (recent.length > RECENT_CALLS_SHOWN) recent.shift();
+    };
+    let previousStateTurn: Turn = this.stateTurn({ recent, plan });
+    let turns: Turn[] = [previousStateTurn];
+    const continueFrom = (
+      result: TurnResult,
+      toolResults: { callId: string; name: string; content: string }[],
+      memory: TurnMemory,
+    ) => {
+      const nextStateTurn = this.stateTurn(memory);
+      const assistantTurn: Turn = { role: 'assistant', text: result.text, toolCalls: result.toolCalls, raw: result.raw };
+      turns = [
+        previousStateTurn,
+        assistantTurn,
+        ...(toolResults.length ? [{ role: 'tool', results: toolResults } satisfies Turn] : []),
+        nextStateTurn,
+      ];
+      previousStateTurn = nextStateTurn;
+    };
     // 上一轮没有调用工具时，下一次请求要求必须调用工具；供应商不支持时整局回退为 auto
     let forceTool = false;
     let canForceTool = true;
-    const limiter = credentialLimiter(hostOf(endpoint), apiKey, this.config.maxConcurrentRequests);
+    let noToolStreak = 0;
+    let invalidToolStreak = 0;
+    const limiter = credentialLimiter(hostOf(endpoint), apiKey, config.maxConcurrentRequests);
     try {
       for (;;) {
         await this.checkpoint();
+        const remainingMs = limits.maxDurationSec * 1000 - this.elapsed();
+        if (this.stats.apiCalls >= limits.maxApiCalls) return this.setStatus('failed', `达到最大 API 调用次数（${limits.maxApiCalls}）`);
+        if (remainingMs <= 0) return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
         let result;
         let attempt = 0;
         for (;;) {
+          await this.checkpoint();
+          const requestRemainingMs = limits.maxDurationSec * 1000 - this.elapsed();
+          if (this.stats.apiCalls >= limits.maxApiCalls) return this.setStatus('failed', `达到最大 API 调用次数（${limits.maxApiCalls}）`);
+          if (requestRemainingMs <= 0) return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
           // 等待同一密钥的并发名额时暂停计时：这是供应商的容量限制，不算模型用时
           if (limiter) {
             this.clockStop();
@@ -346,9 +396,10 @@ export class Contestant {
           const toolChoice = forceTool && canForceTool ? 'required' : 'auto';
           try {
             result = await adapter.call({
-              config: this.config, model: this.model, reasoningEffort: this.effort, maxOutputTokens: this.maxOutputTokens,
+              config, model: this.model, reasoningEffort: this.effort, maxOutputTokens: this.maxOutputTokens,
               endpoint, apiKey, system, tools, turns,
-              toolChoice, signal: this.abort.signal, timeoutMs: null,
+              toolChoice, signal: this.abort.signal,
+              timeoutMs: Math.min(requestRemainingMs, limits.requestTimeoutSec * 1000),
             });
             this.stats.lastLatencyMs = Date.now() - started;
             this.stats.apiLatencyMs += this.stats.lastLatencyMs;
@@ -358,7 +409,8 @@ export class Contestant {
             this.stats.apiLatencyMs += this.stats.lastLatencyMs;
             if (this.abort.signal.aborted) throw new StopSignal();
             const err = e instanceof ProviderError ? e : new ProviderError('network', '请求失败');
-            this.recordCall(null, [], err.message);
+            this.recordCall(null, [], { error: err.message });
+            if (limits.maxDurationSec * 1000 - this.elapsed() <= 0) return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
             // 模型不支持某个可选参数：去掉该参数重试，并明确记录（不计入预算）
             const rejected = rejectedOptionalParam(err, { effort: this.effort !== 'default', forcedTool: toolChoice === 'required' });
             if (rejected) {
@@ -390,7 +442,8 @@ export class Contestant {
               const backoff = Math.min(30_000, 2000 * 2 ** (attempt - 1)) * (0.75 + Math.random() * 0.5);
               const delay = Math.round(err.retryAfterMs ?? backoff);
               this.log('warn', `${err.message}，${(delay / 1000).toFixed(1)} 秒后重试（第 ${attempt}/${maxAttempts} 次）`);
-              await new Promise((r) => setTimeout(r, delay));
+              const waitMs = Math.min(delay, Math.max(0, limits.maxDurationSec * 1000 - this.elapsed()));
+              await new Promise((r) => setTimeout(r, waitMs));
               await this.checkpoint();
               continue;
             }
@@ -406,33 +459,54 @@ export class Contestant {
           this.log('warn', `第 ${this.stats.apiCalls} 次调用的输出达到最大输出 Token 上限被截断${result.toolCalls.length ? '' : '，没有形成工具调用'}`);
         }
 
+        const n = this.stats.apiCalls;
         if (!result.toolCalls.length) {
           this.recordCall(result, []);
           this.emitStats();
+          noToolStreak++;
+          if (noToolStreak >= 3) return this.setStatus('failed', '连续 3 次未调用工具');
           forceTool = true;
-          turns = [this.stateTurn(result.truncated ? `${TRUNCATED_NOTE}\n${NO_TOOL_NUDGE}` : NO_TOOL_NUDGE)];
+          remember({ n, moves: [], error: '未调用工具' });
+          continueFrom(
+            result,
+            [],
+            { recent, plan, notes: result.truncated ? [TRUNCATED_NOTE, NO_TOOL_NUDGE] : [NO_TOOL_NUDGE] },
+          );
           continue;
         }
+        noToolStreak = 0;
         forceTool = false;
         const summaries: { moves: string[]; ok: boolean; error?: string }[] = [];
+        const toolResults: { callId: string; name: string; content: string }[] = [];
+        let newPlan: string | undefined;
         for (const call of result.toolCalls) {
           this.stats.toolCalls++;
           // 必须回复每一个工具调用；复原后或达到上限时，剩余调用不再执行
           const blocked = isSolved(this.state) ? '魔方已复原，未执行' : null;
           const r = blocked
-            ? { content: JSON.stringify({ ok: false, error: blocked, executed: [] }), moves: [], ok: false, error: blocked }
+            ? (() => {
+                const s = describeState(this.state);
+                return {
+                  content: JSON.stringify({ ok: false, error: blocked, executed: [], moves_used: this.stats.moves, correct_stickers: `${s.correct}/${s.total}`, state: { net: s.net, faces: s.faces } }),
+                  moves: [], ok: false, error: blocked,
+                };
+              })()
             : await this.executeTool(call);
           summaries.push({ moves: r.moves, ok: r.ok, error: r.error });
+          toolResults.push({ callId: call.id, name: call.name, content: r.content });
+          const p = (call.args as { plan?: unknown } | null)?.plan;
+          if (typeof p === 'string' && p.trim()) newPlan = p.trim().slice(0, MAX_PLAN_CHARS);
         }
-        this.recordCall(result, summaries);
+        this.recordCall(result, summaries, { plan: newPlan });
         this.emitStats();
         if (isSolved(this.state)) return this.setStatus('solved');
 
-        const feedback = summaries.map((s) => {
-          if (s.ok) return `已执行：${s.moves.join(' ') || '无'}`;
-          return `工具调用未执行：${s.error ?? '未知错误'}`;
-        }).join('\n');
-        turns = [this.stateTurn(`上一轮工具执行摘要：\n${feedback}${result.truncated ? `\n${TRUNCATED_NOTE}` : ''}\n请继续调用 rotate_cube。`)];
+        if (newPlan) plan = { n, text: newPlan };
+        const rejected = summaries.filter((s) => !s.ok).map((s) => s.error ?? '未知错误');
+        invalidToolStreak = summaries.length > 0 && summaries.every((s) => !s.ok) ? invalidToolStreak + 1 : 0;
+        if (invalidToolStreak >= 3) return this.setStatus('failed', '连续 3 次工具调用无效');
+        remember({ n, moves: summaries.flatMap((s) => s.moves), error: rejected.join('；') || undefined });
+        continueFrom(result, toolResults, { recent, plan, notes: result.truncated ? [TRUNCATED_NOTE] : [] });
       }
     } catch (e) {
       if (e instanceof StopSignal || this.abort.signal.aborted) return this.setStatus('stopped', this.failReason ?? '已手动停止');
@@ -442,7 +516,11 @@ export class Contestant {
   }
 
   /** result 为 null 表示请求失败 */
-  private recordCall(result: TurnResult | null, tools: { moves: string[]; ok: boolean; error?: string }[], error?: string) {
+  private recordCall(
+    result: TurnResult | null,
+    tools: { moves: string[]; ok: boolean; error?: string }[],
+    { error, plan }: { error?: string; plan?: string } = {},
+  ) {
     const usage = result?.usage;
     const item = {
       t: this.now(),
@@ -452,6 +530,7 @@ export class Contestant {
       text: result?.text.slice(0, 2000) ?? '',
       reasoning: result?.reasoning ? clipMiddle(result.reasoning, MAX_TRACE_REASONING) : undefined,
       truncated: result?.truncated || undefined,
+      plan,
       tools,
       usage: usage ? { input: usage.input, output: usage.output, reasoning: usage.reasoning } : undefined,
       outcome: error ? 'error' as const : 'success' as const,
@@ -474,6 +553,7 @@ export class Run {
   readonly slots: Semaphore;
   readonly events: RunEvent[] = [];
   status: 'running' | 'finished' = 'running';
+  finishedAt: string | null = null;
   private listeners = new Set<Listener>();
 
   constructor(
@@ -485,7 +565,7 @@ export class Run {
     // 服务端只打乱一次，所有选手共享同一个（不可变的）初始状态
     this.scramble = randomScramble(difficulty.scrambleLength, Math.random, cubeSize);
     this.initialState = Object.freeze(this.scramble.reduce(applyMove, solvedState(cubeSize))) as CubeState;
-    this.slots = new Semaphore(Number.POSITIVE_INFINITY);
+    this.slots = new Semaphore(Math.max(1, Math.floor(limits.concurrency)));
     this.contestants = entries.map((e) => new Contestant(this, e));
     this.emit({ type: 'init', run: this.summary() });
   }
@@ -496,6 +576,8 @@ export class Run {
       createdAt: this.createdAt,
       difficulty: this.difficulty.id,
       cubeSize: this.cubeSize,
+      scrambleLength: this.difficulty.scrambleLength,
+      finishedAt: this.finishedAt ?? undefined,
       scramble: formatAlg(this.scramble),
       initialState: this.initialState.join(''),
       limits: this.limits,
@@ -526,10 +608,19 @@ export class Run {
     for (const c of this.contestants) c.stop('已终止全部测试');
   }
 
+  pauseAll() {
+    for (const c of this.contestants) c.pause();
+  }
+
+  resumeAll() {
+    for (const c of this.contestants) c.resume();
+  }
+
   /** 所有选手真正并发启动（受并发上限约束），互不等待、互不影响 */
   async start() {
     await Promise.allSettled(this.contestants.map((c) => c.start()));
     this.status = 'finished';
+    this.finishedAt = new Date().toISOString();
     await saveRun(this.record()).catch((e) => console.error('保存评测记录失败：', (e as Error).message));
     this.emit({ type: 'done', run: this.summary() });
     this.listeners.clear();

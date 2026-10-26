@@ -37,6 +37,8 @@ export const openaiChatAdapter: ProtocolAdapter = {
     if (ctx.tools.length) {
       body.tools = ctx.tools.map((t) => ({ type: 'function', function: t }));
       body.tool_choice = ctx.toolChoice;
+      // rotate_cube mutates shared per-contestant state; calls from one response must be ordered.
+      body.parallel_tool_calls = false;
     }
     if (ctx.reasoningEffort !== 'default') body.reasoning_effort = ctx.reasoningEffort;
     const modelKey = `${ctx.endpoint}\0${ctx.model}`;

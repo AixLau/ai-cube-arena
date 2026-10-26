@@ -9,23 +9,21 @@ function toInput(turns: Turn[]) {
     else if (t.role === 'assistant') {
       for (const it of (Array.isArray(t.raw) ? t.raw : []) as Record<string, any>[]) {
         if (it.type === 'function_call') {
-          // 不回传 id，避免引用未保存（store=false）的服务端条目
-          items.push({ type: 'function_call', call_id: it.call_id, name: it.name, arguments: it.arguments });
+          // Keep the complete output item. call_id is the stable association used by
+          // function_call_output; id and provider-specific metadata are retained too.
+          items.push({ ...it, type: 'function_call', call_id: it.call_id ?? it.id, name: it.name, arguments: it.arguments });
         } else if (it.type === 'message') {
-          const text = (it.content ?? []).map((c: any) => c.text ?? '').join('');
-          if (text) items.push({ role: 'assistant', content: text });
-        } else if (it.type === 'reasoning') {
-          // Reasoning summaries are safe to replay. Encrypted content lets supported
-          // reasoning models continue the previous turn without exposing hidden CoT.
-          const summary = Array.isArray(it.summary) ? it.summary : [];
-          if (it.encrypted_content || summary.length) {
-            items.push({
-              type: 'reasoning',
-              ...(typeof it.id === 'string' ? { id: it.id } : {}),
-              summary,
-              ...(it.encrypted_content ? { encrypted_content: it.encrypted_content } : {}),
-            });
+          const text = typeof it.content === 'string' ? it.content : (it.content ?? []).map((c: any) => c.text ?? '').join('');
+          if (text) {
+            const { content: _content, ...metadata } = it;
+            items.push({ ...metadata, type: 'message', role: 'assistant', content: text });
           }
+        } else if (it.type === 'reasoning') {
+          // Preserve summary, content, encrypted_content, id and any future metadata.
+          // Empty reasoning items have no replayable context and are omitted.
+          const summary = Array.isArray(it.summary) ? it.summary : [];
+          const content = Array.isArray(it.content) ? it.content : [];
+          if (it.encrypted_content || summary.length || content.length) items.push({ ...it });
         }
       }
     } else {
@@ -37,18 +35,23 @@ function toInput(turns: Turn[]) {
 
 const reasoningSummaryUnsupported = new Set<string>();
 const encryptedReasoningUnsupported = new Set<string>();
+const reasoningEffortUnsupported = new Set<string>();
 
 function optionalReasoningOption(error: unknown, option: 'summary' | 'encrypted'): boolean {
   if (!(error instanceof ProviderError) || error.status !== 400) return false;
   const message = error.message;
-  if (option === 'summary') return /summary|reasoning/i.test(message);
-  return /include|encrypted_content|reasoning/i.test(message);
+  if (option === 'summary') return /reasoning(?:[._\s-])?summary\b/i.test(message);
+  return /\binclude\b|encrypted[_ .-]?content/i.test(message);
+}
+
+function optionalReasoningEffort(error: unknown): boolean {
+  return error instanceof ProviderError && error.status === 400 && /reasoning(?:[._\s-])?effort\b/i.test(error.message);
 }
 
 export const openaiResponsesAdapter: ProtocolAdapter = {
   async call(ctx) {
     const { config } = ctx;
-    const modelKey = `${ctx.endpoint}\0${ctx.model}`;
+    const modelKey = `${config.id}\0${ctx.endpoint}\0${ctx.model}`;
     const body: Record<string, unknown> = {
       model: ctx.model,
       instructions: ctx.system,
@@ -58,16 +61,19 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
     if (ctx.tools.length) {
       body.tools = ctx.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters }));
       body.tool_choice = ctx.toolChoice;
+      body.parallel_tool_calls = false;
     }
-    if (!reasoningSummaryUnsupported.has(modelKey)) {
+    if (ctx.reasoningEffort !== 'default' && !reasoningSummaryUnsupported.has(modelKey)) {
       body.reasoning = {
-        ...(ctx.reasoningEffort !== 'default' ? { effort: ctx.reasoningEffort } : {}),
+        ...(!reasoningEffortUnsupported.has(modelKey) ? { effort: ctx.reasoningEffort } : {}),
         summary: 'concise',
       };
-    } else if (ctx.reasoningEffort !== 'default') {
+    } else if (ctx.reasoningEffort !== 'default' && !reasoningEffortUnsupported.has(modelKey)) {
       body.reasoning = { effort: ctx.reasoningEffort };
     }
-    if (!encryptedReasoningUnsupported.has(modelKey)) body.include = ['reasoning.encrypted_content'];
+    if (ctx.reasoningEffort !== 'default' && !encryptedReasoningUnsupported.has(modelKey)) {
+      body.include = ['reasoning.encrypted_content'];
+    }
     if (ctx.maxOutputTokens) body.max_output_tokens = ctx.maxOutputTokens;
 
     const send = () => postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), body, {
@@ -91,6 +97,13 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
         if (body.reasoning && (body.reasoning as Record<string, unknown>).summary && optionalReasoningOption(e, 'summary')) {
           reasoningSummaryUnsupported.add(modelKey);
           const { summary: _summary, ...reasoning } = body.reasoning as Record<string, unknown>;
+          if (Object.keys(reasoning).length) body.reasoning = reasoning;
+          else delete body.reasoning;
+          continue;
+        }
+        if (body.reasoning && (body.reasoning as Record<string, unknown>).effort && optionalReasoningEffort(e)) {
+          reasoningEffortUnsupported.add(modelKey);
+          const { effort: _effort, ...reasoning } = body.reasoning as Record<string, unknown>;
           if (Object.keys(reasoning).length) body.reasoning = reasoning;
           else delete body.reasoning;
           continue;

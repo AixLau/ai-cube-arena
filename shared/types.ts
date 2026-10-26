@@ -1,4 +1,4 @@
-/** 前后端共用的数据结构（不包含任何 API Key） */
+/** 前后端共用的数据结构；仅 BrowserProvider / ProviderDraft 包含临时使用的 API Key。 */
 
 // ---------------- 模型配置 ----------------
 
@@ -46,7 +46,8 @@ export const PROTOCOLS: ProtocolInfo[] = [
   },
 ];
 
-export type KeySource = 'none' | 'memory' | 'encrypted' | 'env';
+/** API Key 的来源：仅存在当前浏览器会话，不会写入服务端。 */
+export type KeySource = 'none' | 'browser';
 
 /** 供应商：只需协议 + Base URL + API Key，模型列表由供应商接口自动获取 */
 export interface ProviderConfig {
@@ -64,14 +65,12 @@ export interface ProviderConfig {
   modelsFetchedAt: string | null;
   /** 获取模型列表失败的原因（已脱敏） */
   modelsError: string | null;
-  /** 服务端环境变量预置的供应商只读 */
-  readonly?: boolean;
   keySource: KeySource;
   createdAt: string;
   updatedAt: string;
 }
 
-/** 前端提交的供应商草稿：apiKey 仅在新建/修改时随请求发送，服务端永不回传 */
+/** 前端供应商草稿；API Key 只在当前浏览器会话中保存。 */
 export interface ProviderDraft {
   /** 可留空，默认使用主机名 */
   name?: string;
@@ -82,10 +81,11 @@ export interface ProviderDraft {
   manualModels?: string[];
   /** 为空字符串/undefined 表示保持原有密钥 */
   apiKey?: string;
-  /** 明确选择后才加密持久化 */
-  persistKey?: boolean;
-  /** 明确清除已保存的密钥 */
-  clearKey?: boolean;
+}
+
+/** 浏览器会话中的完整供应商记录，apiKey 不会出现在服务端响应或评测记录中。 */
+export interface BrowserProvider extends ProviderConfig {
+  apiKey: string;
 }
 
 /** 推理强度：default 表示不发送该参数，由供应商决定 */
@@ -103,6 +103,8 @@ export interface RunEntry {
   providerId: string;
   model: string;
   reasoningEffort: ReasoningEffort;
+  /** 单次回复的最大输出 Token；null 表示交给供应商默认 */
+  maxOutputTokens?: number | null;
 }
 
 export type ToolSupport = 'supported' | 'not_called' | 'rejected' | 'unknown';
@@ -129,13 +131,29 @@ export interface Difficulty {
   scrambleLength: number;
 }
 
-/** 打乱程度（与魔方阶数组合成最终难度） */
+/** 打乱强度预设（也可自由填写 1～100 步） */
 export const DIFFICULTIES: Difficulty[] = [
-  { id: 'easy', name: '简单 · 3 步打乱', scrambleLength: 3 },
-  { id: 'normal', name: '普通 · 6 步打乱', scrambleLength: 6 },
-  { id: 'hard', name: '困难 · 10 步打乱', scrambleLength: 10 },
-  { id: 'full', name: '完全打乱 · 20 步', scrambleLength: 20 },
+  { id: 'easy', name: '简单', scrambleLength: 10 },
+  { id: 'standard', name: '标准', scrambleLength: 20 },
+  { id: 'hard', name: '困难', scrambleLength: 40 },
+  { id: 'extreme', name: '极限', scrambleLength: 60 },
 ];
+
+export const MAX_SCRAMBLE_LENGTH = 100;
+
+/** 旧版本记录只保存了难度 id，按当时的定义换算打乱步数 */
+const LEGACY_SCRAMBLE: Record<string, number> = { easy: 3, normal: 6, hard: 10, full: 20 };
+
+export function scrambleLengthOf(r: { scrambleLength?: number; difficulty: string; scramble: string }): number {
+  return r.scrambleLength ?? LEGACY_SCRAMBLE[r.difficulty] ?? r.scramble.split(' ').filter(Boolean).length;
+}
+
+/** 打乱步数对应的强度名称 */
+export function scrambleLevelName(n: number): string {
+  const exact = DIFFICULTIES.find((d) => d.scrambleLength === n);
+  if (exact) return exact.name;
+  return n < 10 ? '入门' : n < 20 ? '简单' : n < 40 ? '标准' : n < 60 ? '困难' : '极限';
+}
 
 /** 支持的魔方阶数（只允许外层转动） */
 export const CUBE_SIZE_INFO: { n: number; name: string; level: string }[] = [
@@ -153,6 +171,8 @@ export interface RunLimits {
   maxMovesPerCall: number;
   /** 同时运行的模型数 */
   concurrency: number;
+  /** 单次 API 请求超时（秒） */
+  requestTimeoutSec: number;
 }
 
 export const DEFAULT_LIMITS: RunLimits = {
@@ -160,6 +180,7 @@ export const DEFAULT_LIMITS: RunLimits = {
   maxApiCalls: 60,
   maxMovesPerCall: 10,
   concurrency: 4,
+  requestTimeoutSec: 120,
 };
 
 export type ContestantStatus = 'queued' | 'running' | 'paused' | 'solved' | 'failed' | 'stopped' | 'error';
@@ -178,6 +199,7 @@ export interface ContestantInfo {
   host: string;
   model: string;
   reasoningEffort?: ReasoningEffort;
+  maxOutputTokens?: number | null;
 }
 
 export interface ContestantStats {
@@ -226,8 +248,12 @@ export type TraceItem =
       reasoning?: string;
       /** 输出达到最大输出 Token 被截断 */
       truncated?: boolean;
+      /** 模型在 rotate_cube 的 plan 参数里记下的计划（下一轮会提供给模型） */
+      plan?: string;
       tools: { moves: string[]; ok: boolean; error?: string }[];
+      /** 本次调用供应商返回的用量（未返回为 null） */
       usage?: { input: number | null; output: number | null; reasoning: number | null };
+      /** 请求完成状态；error 表示请求失败但已记录耗时 */
       outcome?: 'success' | 'error';
       error?: string;
     }
@@ -240,6 +266,9 @@ export interface RunSummary {
   difficulty: string;
   /** 魔方阶数；旧记录没有该字段，视为 3 */
   cubeSize?: number;
+  /** 打乱步数；旧记录用 scrambleLengthOf 换算 */
+  scrambleLength?: number;
+  finishedAt?: string;
   scramble: string;
   /** 6×N×N 个字符，URFDLB 顺序 */
   initialState: string;

@@ -1,20 +1,20 @@
 import 'dotenv/config';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import {
-  CUBE_SIZE_INFO, DEFAULT_LIMITS, DIFFICULTIES, PROTOCOLS, REASONING_EFFORTS, TERMINAL_STATUSES, type ProviderDraft, type RunEntry, type RunLimits,
+  CUBE_SIZE_INFO, DEFAULT_LIMITS, DIFFICULTIES, MAX_SCRAMBLE_LENGTH, PROTOCOLS, REASONING_EFFORTS, TERMINAL_STATUSES, type RunEntry, type RunLimits,
 } from '../shared/types.ts';
 import { STATE_ENCODING } from './arena/prompt.ts';
 import { Run, runs, type ContestantEntry } from './arena/run.ts';
 import { listRuns, loadRun } from './arena/store.ts';
-import { encryptionAvailable } from './security/crypto.ts';
 import {
-  createConfig, deleteConfig, DraftError, duplicateConfig, getApiKey, getConfig, listConfigs, modelsOf, refreshModels, updateConfig,
+  DraftError, modelsOf, normalizeProvider, refreshProvider, validateApiKey,
 } from './providers/store.ts';
 import { testConnection } from './providers/test.ts';
 
-const app = express();
+export const app = express();
 app.disable('x-powered-by');
 
 // 正式部署：REQUIRE_HTTPS=true 时拒绝明文请求（反向代理需传递 X-Forwarded-Proto）
@@ -34,7 +34,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api')) res.setHeader('Cache-Control', 'no-store');
   next();
 });
-app.use(express.json({ limit: '64kb' }));
+app.use(express.json({ limit: '1mb' }));
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<unknown>) =>
@@ -49,7 +49,6 @@ app.get('/api/meta', (_req, res) => {
     difficulties: DIFFICULTIES,
     cubeSizes: CUBE_SIZE_INFO,
     defaultLimits: DEFAULT_LIMITS,
-    encryptionAvailable: encryptionAvailable(),
     stateEncoding: STATE_ENCODING,
     reasoningEfforts: REASONING_EFFORTS,
     maxActiveSessions: Number(process.env.MAX_ACTIVE_SESSIONS || 16),
@@ -58,33 +57,19 @@ app.get('/api/meta', (_req, res) => {
 
 // ---------------- 模型配置 ----------------
 
-app.get('/api/providers', wrap(async (_req, res) => res.json(await listConfigs())));
-
-app.post('/api/providers', wrap(async (req, res) => res.json(await createConfig(req.body as ProviderDraft))));
-
-app.put('/api/providers/:id', wrap(async (req, res) => res.json(await updateConfig(String(req.params.id), req.body as ProviderDraft))));
-
-app.post('/api/providers/:id/duplicate', wrap(async (req, res) => res.json(await duplicateConfig(String(req.params.id)))));
-
-app.delete('/api/providers/:id', wrap(async (req, res) => {
-  await deleteConfig(String(req.params.id));
-  res.json({ ok: true });
-}));
-
 /** 重新向供应商获取模型列表 */
-app.post('/api/providers/:id/refresh-models', wrap(async (req, res) => {
-  const cfg = await refreshModels(String(req.params.id));
-  if (!cfg) throw new DraftError('供应商不存在');
+app.post('/api/providers/refresh-models', wrap(async (req, res) => {
+  const cfg = await refreshProvider(req.body?.config, req.body?.apiKey);
   res.json(cfg);
 }));
 
 /** 测试连接：用指定模型发送一次带测试工具的真实请求 */
-app.post('/api/providers/:id/test', wrap(async (req, res) => {
-  const cfg = await getConfig(String(req.params.id));
-  if (!cfg) throw new DraftError('供应商不存在');
+app.post('/api/providers/test', wrap(async (req, res) => {
+  const cfg = normalizeProvider(req.body?.config);
+  const apiKey = validateApiKey(req.body?.apiKey);
   const model = String(req.body?.model ?? '').trim() || modelsOf(cfg)[0];
   if (!model) throw new DraftError('该供应商还没有可用模型');
-  res.json(await testConnection(cfg, await getApiKey(cfg.id), model));
+  res.json(await testConnection(cfg, apiKey, model));
 }));
 
 // ---------------- 评测 ----------------
@@ -95,34 +80,47 @@ const clamp = (v: unknown, min: number, max: number, fallback: number) => {
 };
 
 app.post('/api/runs', wrap(async (req, res) => {
-  const { entries, difficulty = 'easy', cubeSize = 3, limits = {} } = (req.body ?? {}) as {
-    entries?: RunEntry[]; difficulty?: string; cubeSize?: number; limits?: Partial<RunLimits>;
+  const { entries, difficulty, scrambleLength, cubeSize = 3, limits = {} } = (req.body ?? {}) as {
+    entries?: RunEntry[]; providers?: { config: unknown; apiKey?: unknown }[]; difficulty?: string; scrambleLength?: number; cubeSize?: number; limits?: Partial<RunLimits>;
   };
   if (!CUBE_SIZE_INFO.some((c) => c.n === cubeSize)) throw new DraftError('不支持的魔方阶数');
+  // 打乱步数：直接给出步数，或沿用预设 id
+  const steps = scrambleLength ?? DIFFICULTIES.find((d) => d.id === difficulty)?.scrambleLength;
+  if (!Number.isInteger(steps) || steps! < 1 || steps! > MAX_SCRAMBLE_LENGTH) throw new DraftError(`打乱步数应为 1～${MAX_SCRAMBLE_LENGTH}`);
+  const diff = DIFFICULTIES.find((d) => d.scrambleLength === steps) ?? { id: 'custom', name: '自定义', scrambleLength: steps! };
   const list = Array.isArray(entries) ? entries : [];
   if (!list.length) throw new DraftError('请至少选择一个模型');
   if (list.length > 64) throw new DraftError('单局最多 64 个模型');
-  const all = await listConfigs();
+  const supplied: { config: unknown; apiKey?: unknown }[] = Array.isArray(req.body?.providers) ? req.body.providers : [];
+  if (supplied.length > 64) throw new DraftError('单局最多 64 个供应商');
+  const all = supplied.map((p) => {
+    if (!p || typeof p !== 'object') throw new DraftError('供应商配置无效');
+    return { config: normalizeProvider(p.config), apiKey: validateApiKey(p.apiKey) };
+  });
+  const byId = new Map(all.map((p) => [p.config.id, p]));
   const seen = new Set<string>();
   const contestants: ContestantEntry[] = [];
   for (const e of list) {
-    const config = all.find((c) => c.id === String(e?.providerId));
+    const suppliedProvider = byId.get(String(e?.providerId));
+    const config = suppliedProvider?.config;
     const model = String(e?.model ?? '').trim();
     if (!config || !model) throw new DraftError('部分模型不存在，请刷新后重试');
+    if (!suppliedProvider?.apiKey && config.authMode !== 'none') throw new DraftError(`供应商「${config.name}」尚未设置 API Key`);
     if (!modelsOf(config).includes(model)) throw new DraftError(`供应商「${config.name}」没有模型 ${model}`);
     const reasoningEffort = REASONING_EFFORTS.some((r) => r.id === e.reasoningEffort) ? e.reasoningEffort : 'default';
+    const maxOut = e.maxOutputTokens == null || String(e.maxOutputTokens) === '' ? null : Math.round(Number(e.maxOutputTokens));
+    if (maxOut !== null && (!Number.isFinite(maxOut) || maxOut < 64 || maxOut > 200_000)) throw new DraftError('最大输出 Token 应为 64～200000');
     const key = `${config.id}\0${model}\0${reasoningEffort}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    contestants.push({ config, model, reasoningEffort });
+    contestants.push({ config, apiKey: suppliedProvider?.apiKey, model, reasoningEffort, maxOutputTokens: maxOut });
   }
-  const diff = DIFFICULTIES.find((d) => d.id === difficulty);
-  if (!diff) throw new DraftError('未知难度');
   const l: RunLimits = {
     maxDurationSec: clamp(limits.maxDurationSec, 10, 7200, DEFAULT_LIMITS.maxDurationSec),
     maxApiCalls: clamp(limits.maxApiCalls, 1, 1000, DEFAULT_LIMITS.maxApiCalls),
     maxMovesPerCall: clamp(limits.maxMovesPerCall, 1, 50, DEFAULT_LIMITS.maxMovesPerCall),
     concurrency: clamp(limits.concurrency, 1, 64, DEFAULT_LIMITS.concurrency),
+    requestTimeoutSec: clamp(limits.requestTimeoutSec, 10, 600, DEFAULT_LIMITS.requestTimeoutSec),
   };
   const run = new Run(contestants, diff, l, cubeSize);
   runs.set(run.id, run);
@@ -176,12 +174,17 @@ app.get('/api/runs/:id/stream', (req, res) => {
   });
 });
 
-app.post('/api/runs/:id/stop', (req, res) => {
-  const run = runs.get(String(req.params.id));
-  if (!run) return res.status(404).json({ error: '评测不存在或已结束' });
-  run.stopAll();
-  res.json({ ok: true });
-});
+/** 全部模型：暂停 / 继续 / 停止 */
+for (const action of ['pause', 'resume', 'stop'] as const) {
+  app.post(`/api/runs/:id/${action}`, (req, res) => {
+    const run = runs.get(String(req.params.id));
+    if (!run || run.status === 'finished') return res.status(404).json({ error: '评测不存在或已结束' });
+    if (action === 'pause') run.pauseAll();
+    else if (action === 'resume') run.resumeAll();
+    else run.stopAll();
+    res.json({ ok: true });
+  });
+}
 
 app.post('/api/runs/:id/contestants/:cid/:action', (req, res) => {
   const run = runs.get(String(req.params.id));
@@ -214,6 +217,8 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 const port = Number(
   process.env.API_PORT || (process.env.NODE_ENV === 'production' ? process.env.PORT : undefined) || 8787,
 );
-app.listen(port, () => {
-  console.log(`魔方智竞服务已启动：http://localhost:${port}`);
-});
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  app.listen(port, () => {
+    console.log(`魔方智竞服务已启动：http://localhost:${port}`);
+  });
+}
