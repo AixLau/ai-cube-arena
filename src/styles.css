@@ -1333,6 +1333,10 @@ a.btn { text-decoration: none; }
   .challenge { grid-template-columns: minmax(0, 1fr); }
   .sh-visual { left: auto; right: -40px; width: 340px; }
 }
+@media (max-width: 900px) {
+  /* 平板宽度优先保证配置表单可滚动，装饰性 3D 不再撑出页面横向溢出。 */
+  .sh-visual { display: none; }
+}
 @media (max-width: 760px) {
   .sec { padding: 16px; }
   .sec-head { grid-template-columns: auto minmax(0, 1fr); }

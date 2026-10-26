@@ -21,6 +21,8 @@ REQUIRE_HTTPS=true npm start   # Node 服务同时提供 API 与静态页面
 
 测试：`npm test`（魔方引擎、地址拼接、SSRF 防护、脱敏、四种协议适配器、多模型并发评测）。
 
+上线前门禁：`npm run verify:release`。真实供应商链路需要通过环境变量运行 `npm run smoke:provider`，详见 [RELEASE_NOTES.md](./RELEASE_NOTES.md)。
+
 ## 功能
 
 - **官网首页**：品牌主视觉、three.js 实时渲染的 3D 魔方（悬浮、层转动、可拖拽）、环绕式示例模型卡片、平台优势与「接入模型 → 选择难度 → 查看示例 → 进入竞技场配置」四步引导；首页示例模型和模拟演示不会调用真实 API，阶数与打乱程度会带入竞技场。支持浅色 / 深色主题（记住选择，首帧无闪烁）。

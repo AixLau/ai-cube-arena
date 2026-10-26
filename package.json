@@ -11,6 +11,8 @@
     "start": "NODE_ENV=production tsx server/index.ts",
     "test": "tsx --test shared/*.test.ts server/*.test.ts src/lib/*.test.ts",
     "typecheck": "tsc -p tsconfig.json",
+    "verify:release": "node scripts/release-check.mjs",
+    "smoke:provider": "node scripts/real-provider-smoke.mjs",
     "postinstall": "patch-package"
   },
   "dependencies": {
