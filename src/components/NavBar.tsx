@@ -3,7 +3,7 @@ import { useTheme } from '../lib/theme.ts';
 import BrandMark from './BrandMark.tsx';
 
 /** 「竞技场」下的子页面，导航高亮时一并视为竞技场 */
-export const ARENA_PATHS = ['/arena', '/providers', '/history', '/practice'];
+export const ARENA_PATHS = ['/arena', '/providers', '/practice'];
 
 export default function NavBar() {
   const { pathname } = useLocation();
@@ -20,7 +20,7 @@ export default function NavBar() {
         <nav className="nav-links" aria-label="主导航">
           <NavLink to="/" end>首页</NavLink>
           <NavLink to="/arena" className={() => (inArena ? 'active' : '')}>竞技场</NavLink>
-          <NavLink to="/leaderboard">排行榜</NavLink>
+          <NavLink to="/reports">测试报告</NavLink>
         </nav>
         <div className="nav-actions">
           <button
@@ -44,7 +44,7 @@ export default function NavBar() {
             </span>
           </button>
           <Link to="/arena" className="btn dark nav-cta">
-            开始竞技 <span aria-hidden="true">→</span>
+            开始测试 <span aria-hidden="true">→</span>
           </Link>
         </div>
       </div>

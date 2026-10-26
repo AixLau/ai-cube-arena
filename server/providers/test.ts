@@ -46,7 +46,7 @@ export async function testConnection(cfg: ProviderConfig, apiKey: string | undef
     toolMessage: '', usageReported: false, hints: [],
   };
   if (!apiKey && cfg.authMode !== 'none') {
-    return { ...base, message: '尚未设置 API Key（服务重启后，未加密保存的密钥需要重新输入）。' };
+    return { ...base, message: '尚未设置 API Key。' };
   }
 
   const adapter = ADAPTERS[cfg.protocol];

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { DIFFICULTIES, type ContestantState, type RunRecord, type TraceItem } from '../../shared/types.ts';
+import { scrambleLengthOf, type ContestantState, type RunRecord, type TraceItem } from '../../shared/types.ts';
 import ComparisonTable from '../components/ComparisonTable.tsx';
 import CubeViewer, { type CubeViewerHandle } from '../components/CubeViewer.tsx';
 import HiddenFacesToggle from '../components/HiddenFacesToggle.tsx';
@@ -51,6 +51,7 @@ export default function RunDetailPage() {
   const [speed, setSpeed] = useState(4);
   const [showHiddenFaces, setShowHiddenFaces] = useState(false);
   const [traceOf, setTraceOf] = useState<string | null>(null);
+  const [traceFilter, setTraceFilter] = useState<'all' | 'move' | 'call' | 'status' | 'log'>('all');
 
   useEffect(() => {
     api.run(id).then(setRecord).catch((e) => setError(e.message));
@@ -61,7 +62,13 @@ export default function RunDetailPage() {
     if (record) for (const c of record.contestants) out[c.info.id] = (record.traces[c.info.id] ?? []).filter((t): t is MoveItem => t.type === 'move');
     return out;
   }, [record]);
-  const endT = useMemo(() => Math.max(0, ...Object.values(moves).flatMap((m) => m.map((x) => x.t))), [moves]);
+  const endT = useMemo(() => {
+    if (!record) return 0;
+    const traceTimes = Object.values(record.traces).flatMap((items) => items.map((item) => item.t));
+    const durations = record.contestants.map((c) => c.stats.durationMs);
+    const finished = record.finishedAt ? Date.parse(record.finishedAt) - Date.parse(record.createdAt) : 0;
+    return Math.max(0, ...traceTimes, ...durations, finished);
+  }, [record, moves]);
 
   useEffect(() => {
     if (!playing) return;
@@ -94,23 +101,22 @@ export default function RunDetailPage() {
         <div>
           <h1>评测回放</h1>
           <p>
-            {formatDate(record.createdAt)} · {record.cubeSize ?? 3}×{record.cubeSize ?? 3} · {DIFFICULTIES.find((d) => d.id === record.difficulty)?.name} · {n} 个模型 ·
+            {formatDate(record.createdAt)} · {record.cubeSize ?? 3}×{record.cubeSize ?? 3} · {scrambleLengthOf(record)} 步打乱 · {n} 个模型 ·
             打乱 <span className="mono">{record.scramble}</span>
           </p>
         </div>
         <div className="btn-row">
-          <Link to="/history" className="btn ghost">返回列表</Link>
+          <Link to="/reports" className="btn ghost">返回列表</Link>
           <a className="btn ghost" href={api.exportUrl(record.id)} download>导出 JSON</a>
         </div>
       </div>
 
       <section className="glass panel" style={{ marginBottom: 20 }}>
-        <h2 className="panel-title">统一测试规则</h2>
+        <h2 className="panel-title">测试规则</h2>
         <div className="rule-chips">
-          <span className="chip">最大 API 调用 {record.limits.maxApiCalls}</span>
-          <span className="chip">最长 {record.limits.maxDurationSec} 秒</span>
-          <span className="chip">单次最多 {record.limits.maxMovesPerCall} 步</span>
-          <span className="chip">并发 {record.limits.concurrency}</span>
+          <span className="chip">最长运行：{Math.round(record.limits.maxDurationSec / 60)} 分钟</span>
+          <span className="chip">最大调用：{record.limits.maxApiCalls} 次 / 模型</span>
+          <span className="chip">并发：{record.limits.concurrency}</span>
           <span className="chip mono" title="初始状态（URFDLB 顺序 54 格）">初始状态 {record.initialState}</span>
         </div>
       </section>
@@ -119,6 +125,13 @@ export default function RunDetailPage() {
         <button className="btn primary sm" onClick={() => { if (time >= endT) setTime(0); setPlaying(!playing); }} disabled={endT === 0}>
           {playing ? '暂停' : time >= endT && endT > 0 ? '重新播放' : '播放'}
         </button>
+        <button className="btn ghost sm" onClick={() => { setPlaying(false); setTime((t) => Math.max(0, t - 1000)); }} disabled={endT === 0}>上一步</button>
+        <button className="btn ghost sm" onClick={() => { setPlaying(false); setTime((t) => Math.min(endT, t + 1000)); }} disabled={endT === 0}>下一步</button>
+        <button className="btn ghost sm" onClick={() => {
+          const firstError = record.contestants.flatMap((c) => (record.traces[c.info.id] ?? []).filter((t) => (t.type === 'log' && t.level === 'error') || (t.type === 'status' && (t.status === 'failed' || t.status === 'error')) || (t.type === 'call' && t.tools.some((tool) => !tool.ok))).map((t) => t.t)).sort((a, b) => a - b)[0];
+          if (firstError !== undefined) { setPlaying(false); setTime(firstError); }
+        }}>跳到首个错误</button>
+        <button className="btn ghost sm" onClick={() => { setPlaying(false); setTime(Math.max(0, ...Object.values(moves).flatMap((items) => items.map((item) => item.t)))); }} disabled={endT === 0}>最后一步</button>
         <input className="timeline" type="range" min={0} max={endT} step={10} value={time} onChange={(e) => { setPlaying(false); setTime(+e.target.value); }} aria-label="回放进度" />
         <span className="num">{formatDuration(time)} / {formatDuration(endT)}</span>
         <select value={speed} onChange={(e) => setSpeed(+e.target.value)} aria-label="回放速度">
@@ -139,7 +152,7 @@ export default function RunDetailPage() {
       </section>
 
       <section className="glass panel">
-        <h2 className="panel-title">完整轨迹</h2>
+        <h2 className="panel-title">完整轨迹 <span className="hint">调用 → 动作 → 状态 → 错误</span></h2>
         <div className="tabs" style={{ marginBottom: 12 }}>
           {record.contestants.map((c) => (
             <button key={c.info.id} className={traceOf === c.info.id ? 'on' : ''} onClick={() => setTraceOf(traceOf === c.info.id ? null : c.info.id)}>
@@ -148,10 +161,15 @@ export default function RunDetailPage() {
           ))}
         </div>
         {traceOf ? (
+          <>
+          <div className="btn-row trace-filters" style={{ marginBottom: 10 }}>
+            {(['all', 'move', 'call', 'status', 'log'] as const).map((kind) => <button key={kind} className={traceFilter === kind ? 'btn soft sm' : 'btn ghost sm'} onClick={() => setTraceFilter(kind)}>{kind === 'all' ? '全部' : kind === 'move' ? '动作' : kind === 'call' ? '调用' : kind === 'status' ? '状态' : '错误与日志'}</button>)}
+          </div>
           <div className="trace">
-            {trace.filter((t) => t.type !== 'move').map((t, i) => (
+            {trace.filter((t) => traceFilter === 'all' || t.type === traceFilter).map((t, i) => (
               <div key={i} className={`trace-item ${t.type === 'log' ? t.level : t.type === 'status' ? 'status' : ''}`}>
                 <span className="num t">{formatDuration(t.t)}</span>
+                {t.type === 'move' && <span><b>动作</b> · <span className="chip">{t.move}</span> · 第 {t.index} 步</span>}
                 {t.type === 'call' && (
                   <span>
                     <b>第 {t.n} 次调用</b> · {t.latencyMs} ms
@@ -160,9 +178,10 @@ export default function RunDetailPage() {
                     ))}
                     {t.truncated && <span className="chip warn">输出被截断</span>}
                     {t.text && <span className="trace-text">{t.text}</span>}
+                    {t.plan && <span className="trace-text">计划：{t.plan}</span>}
                     {t.reasoning && (
                       <details className="trace-think">
-                        <summary>思考过程</summary>
+                        <summary>供应商返回的思考内容（不可直接比较）</summary>
                         <span className="trace-text">{t.reasoning}</span>
                       </details>
                     )}
@@ -173,6 +192,7 @@ export default function RunDetailPage() {
               </div>
             ))}
           </div>
+          </>
         ) : (
           <p className="hint-text">选择模型查看轨迹</p>
         )}

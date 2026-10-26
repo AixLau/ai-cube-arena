@@ -1,31 +1,34 @@
-import { Route, Routes, useLocation } from 'react-router-dom';
-import ArenaTabs from './components/ArenaTabs.tsx';
+import { Navigate, Route, Routes, useParams } from 'react-router-dom';
 import Backdrop from './components/Backdrop.tsx';
-import NavBar, { ARENA_PATHS } from './components/NavBar.tsx';
+import NavBar from './components/NavBar.tsx';
 import ArenaPage from './pages/ArenaPage.tsx';
-import HistoryPage from './pages/HistoryPage.tsx';
 import HomePage from './pages/HomePage.tsx';
-import LeaderboardPage from './pages/LeaderboardPage.tsx';
 import PracticePage from './pages/PracticePage.tsx';
 import ProvidersPage from './pages/ProvidersPage.tsx';
+import ReportsPage from './pages/ReportsPage.tsx';
 import RunDetailPage from './pages/RunDetailPage.tsx';
 
+function LegacyRun() {
+  const { id } = useParams();
+  return <Navigate to={`/reports/${id}`} replace />;
+}
+
 export default function App() {
-  const { pathname } = useLocation();
-  const inArena = ARENA_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`));
   return (
     <>
       <Backdrop />
       <NavBar />
-      {inArena && <ArenaTabs />}
       <Routes>
         <Route path="/" element={<HomePage />} />
         <Route path="/arena" element={<ArenaPage />} />
         <Route path="/providers" element={<ProvidersPage />} />
-        <Route path="/history" element={<HistoryPage />} />
-        <Route path="/history/:id" element={<RunDetailPage />} />
-        <Route path="/leaderboard" element={<LeaderboardPage />} />
+        <Route path="/reports" element={<ReportsPage />} />
+        <Route path="/reports/:id" element={<RunDetailPage />} />
         <Route path="/practice" element={<PracticePage />} />
+        {/* 旧地址兼容 */}
+        <Route path="/history" element={<Navigate to="/reports" replace />} />
+        <Route path="/history/:id" element={<LegacyRun />} />
+        <Route path="/leaderboard" element={<Navigate to="/reports?tab=leaderboard" replace />} />
         <Route path="*" element={<HomePage />} />
       </Routes>
     </>

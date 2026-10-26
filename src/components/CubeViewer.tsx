@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { TwistyPlayer } from 'cubing/twisty';
 
 export interface CubeViewerHandle {
@@ -26,22 +26,31 @@ const hintMode = (show: boolean) => (show ? 'floating' : 'none');
 const CubeViewer = forwardRef<CubeViewerHandle, Props>(function CubeViewer({ tempoScale = 1, showHiddenFaces = false, setupAlg = '', size = 3 }, ref) {
   const hostRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<TwistyPlayer | null>(null);
+  const [retry, setRetry] = useState(0);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    const player = new TwistyPlayer({
-      puzzle: `${size}x${size}x${size}` as '3x3x3',
-      visualization: 'PG3D',
-      background: 'none',
-      controlPanel: 'none',
-      hintFacelets: hintMode(showHiddenFaces),
-      backView: 'none',
-      experimentalDragInput: 'auto',
-      cameraLatitude: 28,
-      cameraLongitude: 32,
-      tempoScale,
-      experimentalSetupAlg: setupAlg,
-    });
-    hostRef.current!.appendChild(player);
+    let player: TwistyPlayer;
+    setFailed(false);
+    try {
+      player = new TwistyPlayer({
+        puzzle: `${size}x${size}x${size}` as '3x3x3',
+        visualization: 'PG3D',
+        background: 'none',
+        controlPanel: 'none',
+        hintFacelets: hintMode(showHiddenFaces),
+        backView: 'none',
+        experimentalDragInput: 'auto',
+        cameraLatitude: 28,
+        cameraLongitude: 32,
+        tempoScale,
+        experimentalSetupAlg: setupAlg,
+      });
+      hostRef.current?.appendChild(player);
+    } catch {
+      setFailed(true);
+      return;
+    }
     playerRef.current = player;
     // 3D 模型异步加载完成后不一定会重绘首帧（页面布局若无变化就一直空白），这里显式触发一次
     let disposed = false;
@@ -51,14 +60,14 @@ const CubeViewer = forwardRef<CubeViewerHandle, Props>(function CubeViewer({ tem
       .then((vantages) => {
         if (!disposed) for (const v of vantages) v.scheduleRender();
       })
-      .catch(() => {});
+      .catch(() => { if (!disposed) setFailed(true); });
     return () => {
       disposed = true;
       player.remove();
       playerRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [retry]);
 
   useEffect(() => {
     if (playerRef.current) playerRef.current.tempoScale = tempoScale;
@@ -86,7 +95,11 @@ const CubeViewer = forwardRef<CubeViewerHandle, Props>(function CubeViewer({ tem
     },
   }));
 
-  return <div className="stage-cube" ref={hostRef} />;
+  return (
+    <div className="stage-cube" ref={hostRef}>
+      {failed && <div className="cube-fallback" role="status"><span>3D 魔方加载失败，可继续查看状态与动作。</span><button className="btn ghost sm" onClick={() => setRetry((n) => n + 1)}>重试 3D</button></div>}
+    </div>
+  );
 });
 
 export default CubeViewer;

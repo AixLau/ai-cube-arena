@@ -5,6 +5,8 @@ import AutoSolveCube from '../components/AutoSolveCube.tsx';
 import VendorIcon, { type Vendor } from '../components/BrandIcons.tsx';
 import HeroCube from '../components/HeroCube.tsx';
 import MiniCube from '../components/MiniCube.tsx';
+import { loadProviders } from '../lib/providers.ts';
+import type { BrowserProvider } from '../../shared/types.ts';
 
 interface ModelCard {
   vendor: Vendor;
@@ -41,11 +43,11 @@ function HighlightIcon({ name }: { name: (typeof HIGHLIGHTS)[number]['icon'] }) 
   return <svg {...common} fill="currentColor" stroke="none"><rect x="3" y="12" width="3.6" height="8" rx="1" /><rect x="8.6" y="8" width="3.6" height="12" rx="1" /><rect x="14.2" y="4" width="3.6" height="16" rx="1" /><rect x="19.4" y="10" width="2.4" height="10" rx="1" /></svg>;
 }
 
-const PROVIDERS: { vendor: Vendor; name: string; connected: boolean }[] = [
-  { vendor: 'openai', name: 'OpenAI', connected: true },
-  { vendor: 'anthropic', name: 'Anthropic', connected: true },
-  { vendor: 'google', name: 'Google', connected: true },
-  { vendor: 'deepseek', name: 'DeepSeek', connected: false },
+const PROVIDERS: { vendor: Vendor; name: string }[] = [
+  { vendor: 'openai', name: 'OpenAI' },
+  { vendor: 'anthropic', name: 'Anthropic' },
+  { vendor: 'google', name: 'Google' },
+  { vendor: 'deepseek', name: 'DeepSeek' },
 ];
 
 const PICKABLE: { vendor: Vendor; name: string; tags: [string, string] }[] = [
@@ -85,22 +87,24 @@ function SolvePreview({ size }: { size: number }) {
 
 function DemoModal({ onClose }: { onClose(): void }) {
   const [p, setP] = useState({ step: 0, total: 1 });
+  const dialog = useRef<HTMLDivElement>(null);
   useEffect(() => {
+    dialog.current?.querySelector<HTMLElement>('button')?.focus();
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="glass strong modal demo-modal" role="dialog" aria-modal="true" aria-label="观看演示">
+      <div ref={dialog} className="glass strong modal demo-modal" role="dialog" aria-modal="true" aria-labelledby="demo-title" aria-describedby="demo-description">
         <header className="modal-head">
-          <h2>竞技演示</h2>
+          <h2 id="demo-title">模拟演示</h2>
           <button className="icon-btn" onClick={onClose} aria-label="关闭">×</button>
         </header>
-        <div className="demo-body">
+        <div className="demo-body" id="demo-description">
           <AutoSolveCube size={3} scrambleLength={14} intervalMs={750} className="demo-cube auto-solve" onProgress={(step, total) => setP({ step, total })} />
           <div className="demo-meta">
-            <span className="live-dot" /> 模型正在调用 rotate_cube · 步骤 {p.step} / {p.total}
+            <span className="live-dot" /> 模拟演示（不会调用真实 API）· 步骤 {p.step} / {p.total}
           </div>
           <div className="sp-bar"><div style={{ width: `${(p.step / p.total) * 100}%` }} /></div>
         </div>
@@ -113,8 +117,13 @@ export default function HomePage() {
   const visual = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState(3);
   const [level, setLevel] = useState(1);
-  const [picked, setPicked] = useState<string[]>(['GPT-6 Astra', 'Claude Opus 5.5', 'Gemini 4 Argon']);
+  const [picked, setPicked] = useState<string[]>([]);
+  const [providers, setProviders] = useState<BrowserProvider[]>([]);
   const [demo, setDemo] = useState(false);
+
+  useEffect(() => {
+    void loadProviders().then(setProviders).catch(() => setProviders([]));
+  }, []);
 
   // 模型卡片随鼠标轻微视差
   const onMove = (e: React.MouseEvent) => {
@@ -130,7 +139,7 @@ export default function HomePage() {
   };
 
   const difficulty = DIFFICULTIES[level];
-  const arenaLink = `/arena?size=${size}&difficulty=${difficulty.id}`;
+  const arenaLink = `/arena?size=${size}&steps=${difficulty.scrambleLength}`;
 
   return (
     <main className="home">
@@ -153,7 +162,7 @@ export default function HomePage() {
             </Link>
             <button className="btn glassy lg" onClick={() => setDemo(true)}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15l12.5-7.5z" /></svg>
-              观看演示
+              观看模拟演示
             </button>
           </div>
         </div>
@@ -199,13 +208,16 @@ export default function HomePage() {
           <h3>接入你的 AI 模型</h3>
           <p>配置模型服务商的 API Key，自动同步并加载可用模型，快速完成竞技环境接入。</p>
           <ul className="prov-list">
-            {PROVIDERS.map((p) => (
+            {PROVIDERS.map((p) => {
+              const configured = providers.some((x) => x.name.toLowerCase().includes(p.name.toLowerCase()) && (x.keySource !== 'none' || x.authMode === 'none'));
+              return (
               <li key={p.name}>
                 <span className={`vi vendor-${p.vendor}`}><VendorIcon vendor={p.vendor} size={18} /></span>
                 <span className="pl-name">{p.name}</span>
-                <span className={`pl-status ${p.connected ? 'on' : ''}`}>{p.connected ? '已连接' : '未配置'}</span>
+                <span className={`pl-status ${configured ? 'on' : ''}`}>{configured ? '已配置' : '未配置'}</span>
               </li>
-            ))}
+              );
+            })}
           </ul>
           <Link to="/providers" className="step-action">
             <span>＋</span> 添加自定义供应商 <Chevron />
@@ -239,7 +251,7 @@ export default function HomePage() {
             />
             <div className="level-labels">
               <span>简单<small>更快求解</small></span>
-              <span className="level-now">{difficulty.name}</span>
+              <span className="level-now">{difficulty.name} · {difficulty.scrambleLength} 步</span>
               <span>复杂<small>更强推理</small></span>
             </div>
           </div>
@@ -247,8 +259,8 @@ export default function HomePage() {
 
         <article className="step glass">
           <span className="step-no">03</span>
-          <h3>选择竞技模型</h3>
-          <p>自由选择多个 AI 模型参与同场竞技，在相同初始条件下比较不同模型的推理效率与求解策略。</p>
+          <h3>示例模型（仅用于说明）</h3>
+          <p>这里展示常见模型的能力标签，不会把首页勾选直接带入真实评测。请进入竞技场后选择你已配置并验证的模型。</p>
           <ul className="pick-list">
             {PICKABLE.map((m) => {
               const on = picked.includes(m.name);
@@ -257,7 +269,7 @@ export default function HomePage() {
                   <label>
                     <input type="checkbox" checked={on} onChange={() => setPicked((s) => (on ? s.filter((x) => x !== m.name) : [...s, m.name]))} />
                     <span className={`vi vendor-${m.vendor}`}><VendorIcon vendor={m.vendor} size={18} /></span>
-                    <span className="pk-name">{m.name}</span>
+                    <span className="pk-name">{m.name}<small className="cell-sub">示例</small></span>
                     <span className="pk-tags">{m.tags.map((t) => <em key={t}>{t}</em>)}</span>
                   </label>
                 </li>
@@ -276,7 +288,7 @@ export default function HomePage() {
           <SolvePreview size={size} />
           <Link to={arenaLink} className="btn dark block step-go">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" aria-hidden="true"><path d="M12 2.5 20.5 7v10L12 21.5 3.5 17V7Z" /><path d="M3.5 7 12 11.5 20.5 7M12 11.5v10" /></svg>
-            开始竞技 <span aria-hidden="true">→</span>
+            进入竞技场配置 <span aria-hidden="true">→</span>
           </Link>
         </article>
       </section>

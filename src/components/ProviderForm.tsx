@@ -1,14 +1,15 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { displayEndpoint, resolveEndpoint } from '../../shared/endpoint.ts';
-import type { AuthMode, ProtocolId, ProviderConfig, ProviderDraft } from '../../shared/types.ts';
-import { api, type Meta } from '../lib/api.ts';
+import type { AuthMode, BrowserProvider, ProtocolId, ProviderDraft } from '../../shared/types.ts';
+import { type Meta } from '../lib/api.ts';
 import { KEY_SOURCE_TEXT } from '../lib/format.ts';
+import { createProvider, PROVIDER_STORAGE_NOTICE, updateProvider } from '../lib/providers.ts';
 
 interface Props {
   meta: Meta;
-  editing: ProviderConfig | null;
+  editing: BrowserProvider | null;
   onClose(): void;
-  onSaved(cfg: ProviderConfig): void;
+  onSaved(cfg: BrowserProvider): void;
 }
 
 const AUTH_LABEL: Record<AuthMode, string> = {
@@ -23,12 +24,35 @@ export default function ProviderForm({ meta, editing, onClose, onSaved }: Props)
   const [protocol, setProtocol] = useState<ProtocolId>(editing?.protocol ?? 'openai-chat');
   const [baseUrl, setBaseUrl] = useState(editing?.baseUrl ?? '');
   const [apiKey, setApiKey] = useState('');
-  const [persistKey, setPersistKey] = useState(editing?.keySource === 'encrypted');
   const [name, setName] = useState(editing?.name ?? '');
   const [authMode, setAuthMode] = useState<AuthMode>(editing?.authMode ?? 'bearer');
   const [maxConcurrent, setMaxConcurrent] = useState(editing?.maxConcurrentRequests?.toString() ?? '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const initial = useRef({ protocol, baseUrl: editing?.baseUrl ?? '', name: editing?.name ?? '', authMode, maxConcurrent: editing?.maxConcurrentRequests?.toString() ?? '' });
+  const dirty = Boolean(apiKey || protocol !== initial.current.protocol || baseUrl !== initial.current.baseUrl || name !== initial.current.name || authMode !== initial.current.authMode || maxConcurrent !== initial.current.maxConcurrent);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.querySelector<HTMLElement>('input, select, button')?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.preventDefault(); requestClose(); return; }
+      if (e.key !== 'Tab' || !dialog) return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>('button, input, select, summary')].filter((el) => !el.hasAttribute('disabled'));
+      if (!focusable.length) return;
+      const first = focusable[0]; const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
+
+  const requestClose = () => {
+    if (dirty && !window.confirm('当前表单有未保存修改，确定关闭并丢弃吗？')) return;
+    onClose();
+  };
 
   const info = meta.protocols.find((p) => p.id === protocol)!;
   const endpoint = resolveEndpoint(protocol, baseUrl, '{模型}');
@@ -58,27 +82,26 @@ export default function ProviderForm({ meta, editing, onClose, onSaved }: Props)
       authMode,
       maxConcurrentRequests: maxConcurrent.trim() === '' ? null : Number(maxConcurrent),
       apiKey: apiKey || undefined,
-      persistKey,
     };
     try {
-      const cfg = editing ? await api.updateProvider(editing.id, draft) : await api.createProvider(draft);
+      const cfg = editing ? await updateProvider(editing.id, draft) : await createProvider(draft);
       setApiKey('');
       onSaved(cfg);
     } catch (e) {
-      setError((e as Error).message);
+      setError(`保存配置或获取模型失败：${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="glass strong modal narrow" role="dialog" aria-modal="true" aria-label={editing ? '编辑供应商' : '添加供应商'}>
+    <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && requestClose()}>
+      <div ref={dialogRef} className="glass strong modal narrow" role="dialog" aria-modal="true" aria-labelledby="provider-dialog-title" aria-describedby="provider-dialog-description">
         <header className="modal-head">
-          <h2>{editing ? '编辑供应商' : '添加供应商'}</h2>
-          <button className="icon-btn" onClick={onClose} aria-label="关闭">×</button>
+          <h2 id="provider-dialog-title">{editing ? '编辑供应商' : '添加供应商'}</h2>
+          <button className="icon-btn" onClick={requestClose} aria-label="关闭">×</button>
         </header>
-        <div className="modal-body">
+        <div className="modal-body" id="provider-dialog-description">
           <label className="field">
             <span>接口协议</span>
             <select value={protocol} onChange={(e) => changeProtocol(e.target.value as ProtocolId)}>
@@ -103,12 +126,7 @@ export default function ProviderForm({ meta, editing, onClose, onSaved }: Props)
             </span>
             <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} autoComplete="new-password" spellCheck={false} />
           </label>
-          {meta.encryptionAvailable && (
-            <label className="check" style={{ marginBottom: 12 }}>
-              <input type="checkbox" checked={persistKey} onChange={(e) => setPersistKey(e.target.checked)} />
-              在服务端加密保存密钥
-            </label>
-          )}
+          <p className="field-hint">{PROVIDER_STORAGE_NOTICE}</p>
 
           <details className="advanced">
             <summary>高级</summary>
@@ -134,8 +152,8 @@ export default function ProviderForm({ meta, editing, onClose, onSaved }: Props)
         </div>
         <footer className="modal-foot">
           <span style={{ flex: 1 }} />
-          <button className="btn ghost" onClick={onClose}>取消</button>
-          <button className="btn primary" onClick={save} disabled={busy || !baseUrl.trim()}>{busy ? '正在获取模型…' : '保存并获取模型'}</button>
+          <button className="btn ghost" onClick={requestClose}>取消</button>
+          <button className="btn primary" onClick={save} disabled={busy || !baseUrl.trim()}>{busy ? '正在保存并获取模型…' : '保存配置并获取模型'}</button>
         </footer>
       </div>
     </div>

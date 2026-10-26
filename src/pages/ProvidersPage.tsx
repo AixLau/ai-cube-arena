@@ -1,16 +1,17 @@
 import { useEffect, useState } from 'react';
 import { displayEndpoint, resolveEndpoint } from '../../shared/endpoint.ts';
-import type { ConnectionTestResult, ProviderConfig } from '../../shared/types.ts';
+import type { BrowserProvider, ConnectionTestResult, ProviderConfig } from '../../shared/types.ts';
 import ProviderForm from '../components/ProviderForm.tsx';
 import TestResultView from '../components/TestResultView.tsx';
 import { api, type Meta } from '../lib/api.ts';
 import { KEY_SOURCE_TEXT, PROTOCOL_SHORT } from '../lib/format.ts';
+import { deleteProvider, duplicateProvider, loadProviders, PROVIDER_STORAGE_NOTICE, refreshProvider, subscribeProviders, testProvider, updateProvider } from '../lib/providers.ts';
 
 const MODEL_PREVIEW = 24;
 
 const allModels = (c: ProviderConfig) => [...new Set([...c.models, ...c.manualModels])];
 
-function ProviderCard({ c, onChanged, onEdit, onError }: { c: ProviderConfig; onChanged(): void; onEdit(): void; onError(msg: string): void }) {
+function ProviderCard({ c, onChanged, onEdit, onError }: { c: BrowserProvider; onChanged(): void; onEdit(): void; onError(msg: string): void }) {
   const models = allModels(c);
   const [testModel, setTestModel] = useState(models[0] ?? '');
   const [test, setTest] = useState<ConnectionTestResult | 'pending' | null>(null);
@@ -34,13 +35,13 @@ function ProviderCard({ c, onChanged, onEdit, onError }: { c: ProviderConfig; on
 
   const refresh = () => {
     setRefreshing(true);
-    void run(() => api.refreshModels(c.id)).finally(() => setRefreshing(false));
+    void run(() => refreshProvider(c.id)).finally(() => setRefreshing(false));
   };
 
   const doTest = async () => {
     setTest('pending');
     try {
-      setTest(await api.testProvider(c.id, testModel));
+      setTest(await testProvider(c.id, testModel));
     } catch (e) {
       setTest(null);
       onError((e as Error).message);
@@ -48,10 +49,10 @@ function ProviderCard({ c, onChanged, onEdit, onError }: { c: ProviderConfig; on
   };
 
   const updateManual = (list: string[]) =>
-    run(() => api.updateProvider(c.id, { protocol: c.protocol, baseUrl: c.baseUrl, authMode: c.authMode, maxConcurrentRequests: c.maxConcurrentRequests, name: c.name, manualModels: list }));
+    run(() => updateProvider(c.id, { protocol: c.protocol, baseUrl: c.baseUrl, authMode: c.authMode, maxConcurrentRequests: c.maxConcurrentRequests, name: c.name, manualModels: list }));
 
   const remove = () => {
-    if (window.confirm(`确定删除「${c.name}」？其密钥也会一并删除。`)) void run(() => api.deleteProvider(c.id));
+    if (window.confirm(`确定删除「${c.name}」？其密钥也会一并删除。`)) void run(() => deleteProvider(c.id));
   };
 
   const shown = expanded ? models : models.slice(0, MODEL_PREVIEW);
@@ -76,7 +77,7 @@ function ProviderCard({ c, onChanged, onEdit, onError }: { c: ProviderConfig; on
           {shown.map((m) => (
             <span key={m} className="chip" title={m}>
               {m}
-              {c.manualModels.includes(m) && !c.models.includes(m) && !c.readonly && (
+              {c.manualModels.includes(m) && !c.models.includes(m) && (
                 <button className="chip-x" aria-label={`移除 ${m}`} onClick={() => updateManual(c.manualModels.filter((x) => x !== m))}>×</button>
               )}
             </span>
@@ -90,7 +91,7 @@ function ProviderCard({ c, onChanged, onEdit, onError }: { c: ProviderConfig; on
       {c.modelsError && (
         <div className="models-error">
           <p className="form-warn" style={{ margin: 0 }}>{c.modelsError}</p>
-          {!c.readonly && hasKey && (
+          {hasKey && (
             <form
               className="manual-add"
               onSubmit={(e) => {
@@ -118,9 +119,9 @@ function ProviderCard({ c, onChanged, onEdit, onError }: { c: ProviderConfig; on
             <button className="btn ghost" onClick={doTest} disabled={test === 'pending' || !testModel}>{test === 'pending' ? '测试中…' : '测试'}</button>
           </span>
         )}
-        {!c.readonly && <button className="btn ghost" onClick={onEdit}>编辑</button>}
-        <button className="btn ghost" onClick={() => run(() => api.duplicateProvider(c.id))}>复制</button>
-        {!c.readonly && <button className="btn ghost danger-text" onClick={remove}>删除</button>}
+        <button className="btn ghost" onClick={onEdit}>编辑</button>
+        <button className="btn ghost" onClick={() => run(() => duplicateProvider(c.id))}>复制</button>
+        <button className="btn ghost danger-text" onClick={remove}>删除</button>
       </div>
     </article>
   );
@@ -128,14 +129,18 @@ function ProviderCard({ c, onChanged, onEdit, onError }: { c: ProviderConfig; on
 
 export default function ProvidersPage() {
   const [meta, setMeta] = useState<Meta | null>(null);
-  const [configs, setConfigs] = useState<ProviderConfig[]>([]);
-  const [editing, setEditing] = useState<ProviderConfig | null | 'new'>(null);
+  const [configs, setConfigs] = useState<BrowserProvider[]>([]);
+  const [editing, setEditing] = useState<BrowserProvider | null | 'new'>(null);
   const [error, setError] = useState('');
 
-  const reload = () => api.providers().then(setConfigs).catch((e) => setError(e.message));
+  const reload = () => loadProviders().then(setConfigs).catch((e) => {
+    setConfigs([]);
+    setError((e as Error).message);
+  });
   useEffect(() => {
     api.meta().then(setMeta).catch((e) => setError(e.message));
     void reload();
+    return subscribeProviders(() => { void reload(); });
   }, []);
 
   return (
@@ -144,6 +149,7 @@ export default function ProvidersPage() {
         <h1>模型配置</h1>
         <button className="btn primary" onClick={() => setEditing('new')} disabled={!meta}>＋ 添加供应商</button>
       </div>
+      <p className="field-hint">{PROVIDER_STORAGE_NOTICE}</p>
       {error && <p className="form-error">{error}</p>}
 
       <div className="cards">

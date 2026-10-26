@@ -45,9 +45,7 @@ export const STATUS_TEXT: Record<ContestantStatus | 'idle', string> = {
 
 export const KEY_SOURCE_TEXT: Record<KeySource, string> = {
   none: '未设置密钥',
-  memory: '密钥仅在内存（重启失效）',
-  encrypted: '密钥已加密保存',
-  env: '服务端环境变量',
+  browser: '浏览器会话',
 };
 
 export const PROTOCOL_SHORT: Record<ProtocolId, string> = {

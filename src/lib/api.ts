@@ -1,5 +1,5 @@
 import type {
-  ConnectionTestResult, Difficulty, ProtocolInfo, ProviderConfig, ProviderDraft, ReasoningEffort, RunEntry, RunLimits, RunRecord,
+  ConnectionTestResult, Difficulty, ProtocolInfo, ProviderConfig, ReasoningEffort, RunEntry, RunLimits, RunRecord,
   RunSummary,
 } from '../../shared/types.ts';
 
@@ -8,7 +8,6 @@ export interface Meta {
   difficulties: Difficulty[];
   cubeSizes: { n: number; name: string; level: string }[];
   defaultLimits: RunLimits;
-  encryptionAvailable: boolean;
   stateEncoding: string;
   reasoningEfforts: { id: ReasoningEffort; name: string }[];
   maxActiveSessions: number;
@@ -29,18 +28,14 @@ const send = <T>(method: string, url: string, body?: unknown) =>
 
 export const api = {
   meta: () => send<Meta>('GET', '/api/meta'),
-  providers: () => send<ProviderConfig[]>('GET', '/api/providers'),
-  createProvider: (d: ProviderDraft) => send<ProviderConfig>('POST', '/api/providers', d),
-  updateProvider: (id: string, d: ProviderDraft) => send<ProviderConfig>('PUT', `/api/providers/${id}`, d),
-  duplicateProvider: (id: string) => send<ProviderConfig>('POST', `/api/providers/${id}/duplicate`),
-  deleteProvider: (id: string) => send<{ ok: true }>('DELETE', `/api/providers/${id}`),
-  refreshModels: (id: string) => send<ProviderConfig>('POST', `/api/providers/${id}/refresh-models`),
-  testProvider: (id: string, model: string) => send<ConnectionTestResult>('POST', `/api/providers/${id}/test`, { model }),
+  refreshModels: (config: ProviderConfig, apiKey: string) => send<ProviderConfig>('POST', '/api/providers/refresh-models', { config, apiKey }),
+  testProvider: (config: ProviderConfig, apiKey: string, model: string) => send<ConnectionTestResult>('POST', '/api/providers/test', { config, apiKey, model }),
 
-  startRun: (body: { entries: RunEntry[]; difficulty: string; cubeSize: number; limits: RunLimits }) => send<{ id: string }>('POST', '/api/runs', body),
+  startRun: (body: { entries: RunEntry[]; providers: Array<{ config: ProviderConfig; apiKey: string }>; scrambleLength: number; cubeSize: number; limits?: RunLimits }) => send<{ id: string }>('POST', '/api/runs', body),
   runs: () => send<RunSummary[]>('GET', '/api/runs'),
   run: (id: string) => send<RunRecord>('GET', `/api/runs/${id}`),
   stopRun: (id: string) => send<{ ok: true }>('POST', `/api/runs/${id}/stop`),
+  runAction: (id: string, action: 'pause' | 'resume' | 'stop') => send<{ ok: true }>('POST', `/api/runs/${id}/${action}`),
   contestantAction: (id: string, cid: string, action: 'pause' | 'resume' | 'stop') =>
     send<{ ok: boolean }>('POST', `/api/runs/${id}/contestants/${cid}/${action}`),
   streamUrl: (id: string) => `/api/runs/${id}/stream`,

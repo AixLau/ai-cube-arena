@@ -9,7 +9,7 @@
     "dev:web": "vite",
     "build": "tsc -p tsconfig.json && vite build",
     "start": "NODE_ENV=production tsx server/index.ts",
-    "test": "tsx --test shared/*.test.ts server/*.test.ts",
+    "test": "tsx --test shared/*.test.ts server/*.test.ts src/lib/*.test.ts",
     "typecheck": "tsc -p tsconfig.json",
     "postinstall": "patch-package"
   },
