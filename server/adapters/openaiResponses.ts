@@ -118,7 +118,12 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
     const thoughts: string[] = [];
     const rawOutput: Record<string, any>[] = [];
     const allowedTools = new Set(ctx.tools.map((tool) => tool.name));
-    for (const [index, it] of (json.output as Record<string, any>[]).entries()) {
+    const output = json.output as unknown[];
+    for (const [index, item] of output.entries()) {
+      if (!item || typeof item !== 'object' || Array.isArray(item) || typeof (item as any).type !== 'string') {
+        throw new ProviderError('parse', 'Responses output 包含无效 item');
+      }
+      const it = item as Record<string, any>;
       if (it?.type !== 'function_call') {
         rawOutput.push(it);
         continue;
@@ -129,6 +134,7 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
       rawOutput.push({ ...it, id: it.id ?? callId, call_id: callId, name, arguments: normalizeArguments(it.arguments), _originalArguments: it.arguments });
     }
     for (const it of rawOutput) {
+      if (!it || typeof it !== 'object') throw new ProviderError('parse', 'Responses output 包含无效 item');
       if (it.type === 'function_call') {
         const args = parseArgs(it.arguments);
         toolCalls.push({ id: String(it.call_id), name: String(it.name), ...args, ...(argumentsError(it._originalArguments) ? { args: null, argsError: argumentsError(it._originalArguments) } : {}) });

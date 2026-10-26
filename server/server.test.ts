@@ -427,6 +427,11 @@ test('HTTP 供应商接口：移除旧存储接口，环境变量不预置，每
       const events = await (await fetch(`${origin}/api/runs/${id}/stream`)).text();
       assert.ok(!events.includes(config.apiKey));
       assert.ok(!events.includes('thinking…'), 'SSE 默认不公开原始 reasoning');
+      const publicRecord = await (await fetch(`${origin}/api/runs/${id}`)).json() as Record<string, unknown>;
+      assert.equal('scramble' in publicRecord, false);
+      assert.equal('initialState' in publicRecord, false);
+      const privateReport = await (await fetch(`${origin}/api/runs/${id}/report`)).json() as Record<string, unknown>;
+      assert.equal(typeof privateReport.scramble, 'string');
       const exported = await (await fetch(`${origin}/api/runs/${id}/export`)).json() as {
         contestants: { status: string }[];
       };

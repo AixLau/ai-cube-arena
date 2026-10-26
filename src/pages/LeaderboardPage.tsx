@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { CUBE_SIZE_INFO, scrambleLengthOf, type ContestantState, type RunSummary } from '../../shared/types.ts';
+import { CUBE_SIZE_INFO, scrambleLengthOf, type ContestantState, type PublicRunSummary } from '../../shared/types.ts';
 import { api } from '../lib/api.ts';
 import { EFFORT_TEXT, formatCost, formatDate, formatDuration, formatTokens } from '../lib/format.ts';
 
@@ -25,7 +25,7 @@ const avg = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
 const avgOrNull = (xs: (number | null)[]) => (xs.length && xs.every((x) => x !== null) ? avg(xs as number[]) : null);
 
 export default function LeaderboardPage({ embedded = false }: { embedded?: boolean }) {
-  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [runs, setRuns] = useState<PublicRunSummary[]>([]);
   const [steps, setSteps] = useState<number | 'all'>('all');
   const [size, setSize] = useState(3);
   const [loading, setLoading] = useState(true);

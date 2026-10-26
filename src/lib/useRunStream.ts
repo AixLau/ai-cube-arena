@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
-import type { ContestantState, PublicRunSummary, RunEvent, RunEventEnvelope, RunRecord, RunSummary, TraceItem } from '../../shared/types.ts';
+import type { ContestantState, PublicRunRecord, PublicRunSummary, RunEvent, RunEventEnvelope, RunRecord, RunSummary, TraceItem } from '../../shared/types.ts';
 import { api } from './api.ts';
 
 export interface LiveContestant {
@@ -25,7 +25,7 @@ export interface RunView {
   reconnect(): void;
 }
 
-type Action = { type: 'reset' } | { type: 'event'; e: RunEvent } | { type: 'hydrate'; record: RunRecord } | { type: 'connection'; state: 'open' | 'lost' };
+type Action = { type: 'reset' } | { type: 'event'; e: RunEvent } | { type: 'hydrate'; record: RunRecord | PublicRunRecord } | { type: 'connection'; state: 'open' | 'lost' };
 
 const initial: Omit<RunView, 'reconnect'> = { run: null, order: [], cs: {}, finished: false, connection: 'idle', lastUpdatedAt: null };
 
@@ -33,7 +33,7 @@ function blankContestant(state: ContestantState): LiveContestant {
   return { state, moves: [], moveTimes: [], calls: [], logs: [], statsAt: Date.now() };
 }
 
-function fromRecord(record: RunRecord): Omit<RunView, 'reconnect'> {
+function fromRecord(record: RunRecord | PublicRunRecord): Omit<RunView, 'reconnect'> {
   const cs: Record<string, LiveContestant> = {};
   for (const c of record.contestants) {
     const live = blankContestant(c);

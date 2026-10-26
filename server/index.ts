@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import {
-  CUBE_SIZE_INFO, DEFAULT_LIMITS, DIFFICULTIES, MAX_SCRAMBLE_LENGTH, PROTOCOLS, REASONING_EFFORTS, TERMINAL_STATUSES, type RunEntry, type RunEventEnvelope, type RunLimits,
+  CUBE_SIZE_INFO, DEFAULT_LIMITS, DIFFICULTIES, MAX_SCRAMBLE_LENGTH, PROTOCOLS, REASONING_EFFORTS, TERMINAL_STATUSES, type PublicRunRecord, type PublicRunSummary, type RunEntry, type RunEventEnvelope, type RunLimits, type RunRecord, type RunSummary,
 } from '../shared/types.ts';
 import { STATE_ENCODING } from './arena/prompt.ts';
 import { MAX_ACTIVE_SESSIONS, Run, runs, type ContestantEntry } from './arena/run.ts';
@@ -48,6 +48,17 @@ function stripReasoning<T extends { traces: Record<string, any[]> }>(record: T):
     return publicItem;
   })]));
   return { ...record, traces };
+}
+
+function publicSummaryOf(summary: RunSummary): PublicRunSummary {
+  const { scramble: _scramble, initialState: _initialState, ...publicSummary } = summary;
+  return publicSummary;
+}
+
+function publicRecordOf(record: RunRecord): PublicRunRecord {
+  const safe = stripReasoning(record);
+  const { scramble: _scramble, initialState: _initialState, ...publicRecord } = safe;
+  return publicRecord;
 }
 
 // ---------------- 元数据 ----------------
@@ -145,13 +156,23 @@ app.post('/api/runs', wrap(async (req, res) => {
 
 app.get('/api/runs', wrap(async (_req, res) => {
   const live = [...runs.values()].filter((r) => !r.done).map((r) => r.publicSummary());
-  const saved = (await listRuns()).filter((s) => !live.some((l) => l.id === s.id));
+  const saved = (await listRuns()).filter((s) => !live.some((l) => l.id === s.id)).map(publicSummaryOf);
   res.json([...live, ...saved]);
 }));
 
 app.get('/api/runs/:id', wrap(async (req, res) => {
   const live = runs.get(String(req.params.id));
-  const record = live ? (live.done ? live.reportRecord() : live.publicRecord()) : await loadRun(String(req.params.id));
+  if (live) return res.json(live.publicRecord());
+  const record = await loadRun(String(req.params.id));
+  if (!record) return res.status(404).json({ error: '记录不存在' });
+  res.json(publicRecordOf(record));
+}));
+
+/** 私有报告接口：供报告页和导出使用；共享部署应在此处增加 ownership 鉴权。 */
+app.get('/api/runs/:id/report', wrap(async (req, res) => {
+  const live = runs.get(String(req.params.id));
+  if (live && !live.done) return res.status(409).json({ error: '评测尚未结束' });
+  const record = live ? live.reportRecord() : await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
   res.json(stripReasoning(record));
 }));
@@ -203,6 +224,7 @@ app.get('/api/runs/:id/stream', (req, res) => {
     }
   };
   unsubscribe = run.subscribeAndReplay(after, send);
+  if (closed) unsubscribe();
   if (run.done && !closed) {
     closed = true;
     unsubscribe();

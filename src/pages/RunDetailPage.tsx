@@ -54,7 +54,7 @@ export default function RunDetailPage() {
   const [traceFilter, setTraceFilter] = useState<'all' | 'move' | 'call' | 'status' | 'log'>('all');
 
   useEffect(() => {
-    api.run(id).then(setRecord).catch((e) => setError(e.message));
+    api.report(id).then(setRecord).catch((e) => setError(e.message));
   }, [id]);
 
   const moves = useMemo(() => {

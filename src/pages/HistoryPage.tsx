@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { scrambleLengthOf, type RunSummary } from '../../shared/types.ts';
+import { scrambleLengthOf, type PublicRunSummary } from '../../shared/types.ts';
 import { api } from '../lib/api.ts';
 import { formatDate } from '../lib/format.ts';
 
 export default function HistoryPage({ embedded = false }: { embedded?: boolean }) {
-  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [runs, setRuns] = useState<PublicRunSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [query, setQuery] = useState('');
@@ -71,7 +71,7 @@ export default function HistoryPage({ embedded = false }: { embedded?: boolean }
                     <td className="cell-models">{r.contestants.map((c) => c.info.model).join('、')}</td>
                     <td className="r">{solved}/{r.contestants.length}</td>
                     <td>{r.status === 'running' ? <span className="badge running"><span className="dot" />进行中</span> : '已结束'}</td>
-                    <td className="mono cell-sub">{r.scramble}</td>
+                    <td className="mono cell-sub">题目受保护</td>
                     <td>
                       {r.status === 'running'
                         ? <Link to={`/arena?run=${r.id}`}>观看直播 →</Link>

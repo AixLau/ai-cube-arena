@@ -104,11 +104,16 @@ export function normalizeArguments(raw: unknown): string {
       return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? raw : '{}';
     } catch { return '{}'; }
   }
-  try { return JSON.stringify(raw ?? {}); } catch { return '{}'; }
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    try { return JSON.stringify(raw); } catch { return '{}'; }
+  }
+  return '{}';
 }
 
 export function argumentsError(raw: unknown): string | undefined {
-  if (typeof raw !== 'string') return undefined;
+  if (raw === undefined) return undefined;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return undefined;
+  if (typeof raw !== 'string') return '工具参数不是 JSON 对象';
   try {
     const parsed = JSON.parse(raw);
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? undefined : '工具参数不是 JSON 对象';

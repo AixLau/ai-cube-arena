@@ -91,14 +91,21 @@ export const MAX_ACTIVE_SESSIONS = positiveIntEnv(process.env.MAX_ACTIVE_SESSION
 export const globalSessions = new Semaphore(MAX_ACTIVE_SESSIONS);
 
 /** 同一密钥 + 同一主机共享的请求并发上限（键为哈希，内存中也不保存密钥原文） */
-const credentialLimiters = new Map<string, Semaphore>();
+const credentialLimiters = new Map<string, { semaphore: Semaphore; lastUsedAt: number }>();
 function credentialLimiter(host: string, apiKey: string | undefined, limit: number | null): Semaphore | null {
   if (!limit) return null;
-  const key = createHash('sha256').update(`${host}\0${apiKey ?? ''}`).digest('hex');
-  let sem = credentialLimiters.get(key);
-  if (!sem) credentialLimiters.set(key, (sem = new Semaphore(limit)));
-  return sem;
+  const key = createHash('sha256').update(`${host}\0${apiKey ?? ''}\0${limit}`).digest('hex');
+  const now = Date.now();
+  let entry = credentialLimiters.get(key);
+  if (!entry) credentialLimiters.set(key, (entry = { semaphore: new Semaphore(limit), lastUsedAt: now }));
+  entry.lastUsedAt = now;
+  return entry.semaphore;
 }
+
+setInterval(() => {
+  const cutoff = Date.now() - 30 * 60_000;
+  for (const [key, entry] of credentialLimiters) if (entry.lastUsedAt < cutoff) credentialLimiters.delete(key);
+}, 10 * 60_000).unref();
 
 /** 网络错误、超时、5xx 的重试次数（计入 API 调用预算） */
 const MAX_RETRIES = 2;
@@ -125,6 +132,8 @@ function rejectedOptionalParam(err: ProviderError, sent: { effort: boolean; forc
 
 /** 思考内容可能很长：保留开头与结尾（结论通常在末尾），控制事件与记录体积 */
 const MAX_TRACE_REASONING = 4000;
+export const MAX_TRACE_ITEMS = 20_000;
+export const MAX_RUN_EVENTS = 50_000;
 function clipMiddle(s: string, max: number): string {
   if (s.length <= max) return s;
   const head = Math.floor(max / 4);
@@ -215,6 +224,11 @@ export class Contestant {
   private resumeWaiters: (() => void)[] = [];
   private activeSince: number | null = null;
 
+  private appendTrace(item: TraceItem) {
+    if (this.trace.length >= MAX_TRACE_ITEMS) this.trace.shift();
+    this.trace.push(item);
+  }
+
   private config: ProviderConfig | undefined;
   private readonly model: string;
   private readonly maxOutputTokens: number | null;
@@ -276,7 +290,7 @@ export class Contestant {
     this.status = status;
     if (reason) this.failReason = reason;
     const t = this.now();
-    this.trace.push({ t, type: 'status', status, reason: reason ?? undefined });
+    this.appendTrace({ t, type: 'status', status, reason: reason ?? undefined });
     this.run.emit({ type: 'status', cid: this.info.id, status, reason, t });
     this.emitStats();
   }
@@ -287,7 +301,7 @@ export class Contestant {
 
   private log(level: 'info' | 'warn' | 'error', text: string) {
     const t = this.now();
-    this.trace.push({ t, type: 'log', level, text });
+    this.appendTrace({ t, type: 'log', level, text });
     this.run.emit({ type: 'log', cid: this.info.id, level, text, t });
   }
 
@@ -426,7 +440,7 @@ export class Contestant {
       this.stats.lastMove = token;
       this.stats.correctStickers = correctStickers(this.state);
       const t = this.now();
-      this.trace.push({ t, type: 'move', move: token, index: this.stats.moves });
+      this.appendTrace({ t, type: 'move', move: token, index: this.stats.moves });
       this.run.emit({ type: 'move', cid: this.info.id, move: token, index: this.stats.moves, t });
       if (isSolved(this.state)) break;
     }
@@ -788,7 +802,7 @@ export class Contestant {
       outcome: error ? 'error' as const : 'success' as const,
       error,
     };
-    this.trace.push(item);
+    this.appendTrace(item);
     this.run.emit({ type: 'call', cid: this.info.id, item });
   }
 }
@@ -869,6 +883,7 @@ export class Run {
 
   emit(e: RunEvent) {
     const envelope = { seq: ++this.eventSeq, event: e } satisfies RunEventEnvelope;
+    if (this.events.length >= MAX_RUN_EVENTS) this.events.shift();
     this.events.push(envelope);
     for (const fn of this.listeners) fn(envelope);
   }

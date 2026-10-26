@@ -144,8 +144,8 @@ export const MAX_SCRAMBLE_LENGTH = 100;
 /** 旧版本记录只保存了难度 id，按当时的定义换算打乱步数 */
 const LEGACY_SCRAMBLE: Record<string, number> = { easy: 3, normal: 6, hard: 10, full: 20 };
 
-export function scrambleLengthOf(r: { scrambleLength?: number; difficulty: string; scramble: string }): number {
-  return r.scrambleLength ?? LEGACY_SCRAMBLE[r.difficulty] ?? r.scramble.split(' ').filter(Boolean).length;
+export function scrambleLengthOf(r: { scrambleLength?: number; difficulty: string; scramble?: string }): number {
+  return r.scrambleLength ?? LEGACY_SCRAMBLE[r.difficulty] ?? r.scramble?.split(' ').filter(Boolean).length ?? 0;
 }
 
 /** 打乱步数对应的强度名称 */
@@ -296,8 +296,12 @@ export interface RunRecord extends RunSummary {
 /** 运行中的公开摘要：不包含可直接泄露题目的 scramble 和初始面状态。 */
 export type PublicRunSummary = Omit<RunSummary, 'scramble' | 'initialState'>;
 
+export type CallTrace = Extract<TraceItem, { type: 'call' }>;
+export type PublicCallTrace = Omit<CallTrace, 'reasoning'>;
+export type PublicTraceItem = Exclude<TraceItem, CallTrace> | PublicCallTrace;
+
 export interface PublicRunRecord extends PublicRunSummary {
-  traces: Record<string, TraceItem[]>;
+  traces: Record<string, PublicTraceItem[]>;
 }
 
 export type RunEvent =

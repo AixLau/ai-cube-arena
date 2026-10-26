@@ -1,6 +1,5 @@
 import type {
-  ConnectionTestResult, Difficulty, ProtocolInfo, ProviderConfig, ReasoningEffort, RunEntry, RunLimits, RunRecord,
-  RunSummary,
+  ConnectionTestResult, Difficulty, ProtocolInfo, ProviderConfig, PublicRunRecord, PublicRunSummary, ReasoningEffort, RunEntry, RunLimits, RunRecord,
 } from '../../shared/types.ts';
 
 export interface Meta {
@@ -32,8 +31,9 @@ export const api = {
   testProvider: (config: ProviderConfig, apiKey: string, model: string) => send<ConnectionTestResult>('POST', '/api/providers/test', { config, apiKey, model }),
 
   startRun: (body: { entries: RunEntry[]; providers: Array<{ config: ProviderConfig; apiKey: string }>; scrambleLength: number; cubeSize: number; limits?: RunLimits }) => send<{ id: string }>('POST', '/api/runs', body),
-  runs: () => send<RunSummary[]>('GET', '/api/runs'),
-  run: (id: string) => send<RunRecord>('GET', `/api/runs/${id}`),
+  runs: () => send<PublicRunSummary[]>('GET', '/api/runs'),
+  run: (id: string) => send<PublicRunRecord>('GET', `/api/runs/${id}`),
+  report: (id: string) => send<RunRecord>('GET', `/api/runs/${id}/report`),
   stopRun: (id: string) => send<{ ok: true }>('POST', `/api/runs/${id}/stop`),
   runAction: (id: string, action: 'pause' | 'resume' | 'stop') => send<{ ok: true }>('POST', `/api/runs/${id}/${action}`),
   contestantAction: (id: string, cid: string, action: 'pause' | 'resume' | 'stop') =>

@@ -41,6 +41,7 @@ test('SSE：事件序号、回放和 Last-Event-ID 不丢失终态', async (t) =
   const firstIds = [...first.body.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]));
   assert.deepEqual(firstIds, [1, 2]);
   assert.doesNotMatch(first.body, /"scramble"|"initialState"/);
+  assert.equal((run as any).listeners.size, 0, '已完成 run 回放 done 后不应残留 listener');
   assert.match(first.body, /"event":\{"type":"done"/);
 
   const replay = await get(url, { 'Last-Event-ID': '1' });
