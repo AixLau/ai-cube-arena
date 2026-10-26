@@ -10,7 +10,7 @@ import {
 } from '../../shared/types.ts';
 import { ADAPTERS } from '../adapters/index.ts';
 import { ProviderError } from '../adapters/http.ts';
-import type { ToolCall, Turn, TurnResult } from '../adapters/types.ts';
+import { DeadlineExceededError, type ToolCall, type Turn, type TurnResult } from '../adapters/types.ts';
 import { redact } from '../security/redact.ts';
 import {
   describeState, MAX_PLAN_CHARS, NO_TOOL_NUDGE, RECENT_CALLS_SHOWN, rotateCubeTool, systemPrompt, TRUNCATED_NOTE, turnMessage,
@@ -351,8 +351,13 @@ export class Contestant {
         await this.checkpoint();
         continue;
       }
-      await this.checkpoint();
-      return true;
+      try {
+        await this.checkpoint();
+        return true;
+      } catch (error) {
+        slot.release();
+        throw error;
+      }
     }
   }
 
@@ -589,6 +594,10 @@ export class Contestant {
               if (this.queueExpired()) return this.setStatus('failed', `等待并发名额时超过最大运行时间（${limits.maxDurationSec} 秒）`);
               throw new StopSignal();
             }
+            if (deadline - Date.now() <= 0) {
+              limiter.release();
+              return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
+            }
           }
           this.stats.apiCalls++;
           // 请求发出前立即同步计数，前端可在模型思考期间显示当前调用次数。
@@ -623,6 +632,7 @@ export class Contestant {
             this.stats.lastLatencyMs = Date.now() - started;
             this.stats.apiLatencyMs += this.stats.lastLatencyMs;
             if (this.abort.signal.aborted) throw new StopSignal();
+            if (e instanceof DeadlineExceededError) return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
             const err = e instanceof ProviderError ? e : new ProviderError('network', '请求失败');
             this.recordCall(null, [], { error: err.message });
             if (deadline - Date.now() <= 0) return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
@@ -866,6 +876,23 @@ export class Run {
   subscribe(fn: Listener) {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
+  }
+
+  /** 原子化地建立订阅并回放快照；回放期间产生的事件按 seq 排到快照之后。 */
+  subscribeAndReplay(afterSeq: number, fn: Listener) {
+    const snapshot = this.events.slice();
+    let replaying = true;
+    const pending: RunEventEnvelope[] = [];
+    const listener: Listener = (envelope) => {
+      if (envelope.seq <= afterSeq) return;
+      if (replaying) pending.push(envelope);
+      else fn(envelope);
+    };
+    this.listeners.add(listener);
+    for (const envelope of snapshot) listener(envelope);
+    replaying = false;
+    pending.sort((a, b) => a.seq - b.seq).forEach(fn);
+    return () => this.listeners.delete(listener);
   }
 
   get done() {

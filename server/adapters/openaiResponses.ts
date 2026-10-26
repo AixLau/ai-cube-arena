@@ -1,5 +1,5 @@
 import { authHeaders, postJson, ProviderError } from './http.ts';
-import { contextTimeout, normalizeArguments, normalizeToolCallId, normalizeToolName, parseArgs, reportedCost, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
+import { argumentsError, contextTimeout, normalizeArguments, normalizeToolCallId, normalizeToolName, parseArgs, reportedCost, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
 
 /** OpenAI Responses API（input items / function_call / function_call_output） */
 function toInput(turns: Turn[]) {
@@ -117,19 +117,22 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
     let text = '';
     const thoughts: string[] = [];
     const rawOutput: Record<string, any>[] = [];
+    const allowedTools = new Set(ctx.tools.map((tool) => tool.name));
     for (const [index, it] of (json.output as Record<string, any>[]).entries()) {
       if (it?.type !== 'function_call') {
         rawOutput.push(it);
         continue;
       }
-      const name = normalizeToolName(it.name);
+      const name = normalizeToolName(it.name, allowedTools);
       if (!name) continue;
       const callId = normalizeToolCallId(it.call_id ?? it.id, `responses_call_${index}`);
-      rawOutput.push({ ...it, id: it.id ?? callId, call_id: callId, name, arguments: normalizeArguments(it.arguments) });
+      rawOutput.push({ ...it, id: it.id ?? callId, call_id: callId, name, arguments: normalizeArguments(it.arguments), _originalArguments: it.arguments });
     }
     for (const it of rawOutput) {
       if (it.type === 'function_call') {
-        toolCalls.push({ id: String(it.call_id), name: String(it.name), ...parseArgs(it.arguments) });
+        const args = parseArgs(it.arguments);
+        toolCalls.push({ id: String(it.call_id), name: String(it.name), ...args, ...(argumentsError(it._originalArguments) ? { args: null, argsError: argumentsError(it._originalArguments) } : {}) });
+        delete it._originalArguments;
       } else if (it.type === 'message') {
         text += (it.content ?? []).filter((c: any) => c.type === 'output_text').map((c: any) => c.text).join('');
       } else if (it.type === 'reasoning') {

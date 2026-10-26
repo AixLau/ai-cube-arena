@@ -180,15 +180,19 @@ app.get('/api/runs/:id/stream', (req, res) => {
   const after = Number(req.get('Last-Event-ID') ?? 0);
   let closed = false;
   let unsubscribe = () => {};
+  let lastSentSeq = after;
+  let ping: ReturnType<typeof setInterval> | null = null;
   const send = (envelope: RunEventEnvelope) => {
-    if (closed || envelope.seq <= after || res.destroyed || res.writableEnded) return;
+    if (closed || envelope.seq <= lastSentSeq || res.destroyed || res.writableEnded) return;
     try {
       const event = envelope.event.type === 'call' && 'reasoning' in envelope.event.item
         ? { ...envelope, event: { ...envelope.event, item: (({ reasoning: _reasoning, ...item }) => item)(envelope.event.item) } }
         : envelope;
       res.write(`id: ${envelope.seq}\ndata: ${JSON.stringify(event)}\n\n`);
+      lastSentSeq = envelope.seq;
       if (envelope.event.type === 'done') {
         closed = true;
+        if (ping) clearInterval(ping);
         unsubscribe();
         res.end();
       }
@@ -198,19 +202,20 @@ app.get('/api/runs/:id/stream', (req, res) => {
       res.end();
     }
   };
-  unsubscribe = run.subscribe(send);
-  run.events.forEach(send);
+  unsubscribe = run.subscribeAndReplay(after, send);
   if (run.done && !closed) {
     closed = true;
     unsubscribe();
     res.end();
   }
-  const ping = setInterval(() => {
-    if (!closed && !res.destroyed && !res.writableEnded) res.write(': ping\n\n');
+  if (!closed) ping = setInterval(() => {
+    if (closed || res.destroyed || res.writableEnded) return;
+    try { res.write(': ping\n\n'); }
+    catch { closed = true; if (ping) clearInterval(ping); unsubscribe(); }
   }, 15_000);
   req.on('close', () => {
     closed = true;
-    clearInterval(ping);
+    if (ping) clearInterval(ping);
     unsubscribe();
   });
 });

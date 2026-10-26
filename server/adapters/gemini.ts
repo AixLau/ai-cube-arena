@@ -79,13 +79,14 @@ export const geminiAdapter: ProtocolAdapter = {
     const parts: any[] = cand.content?.parts ?? [];
     const normalizedParts: any[] = [];
     const toolCalls: ToolCall[] = [];
+    const allowedTools = new Set(ctx.tools.map((tool) => tool.name));
     let text = '';
     const thoughtTexts: string[] = [];
     parts.forEach((p, i) => {
       if (p.functionCall) {
         const args = p.functionCall.args;
         const ok = !args || (typeof args === 'object' && !Array.isArray(args));
-        const name = normalizeToolName(p.functionCall.name);
+        const name = normalizeToolName(p.functionCall.name, allowedTools);
         if (!name) return;
         const id = normalizeToolCallId(p.functionCall.id, `gemini_call_${i}`);
         const parsedArgs = ok ? (args ?? {}) : parseArgs(normalizeArguments(args)).args;

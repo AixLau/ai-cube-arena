@@ -1,5 +1,5 @@
 import { authHeaders, postJson, ProviderError } from './http.ts';
-import { contextTimeout, normalizeArguments, normalizeToolCallId, normalizeToolName, parseArgs, reportedCost, splitThinkTags, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
+import { argumentsError, contextTimeout, normalizeArguments, normalizeToolCallId, normalizeToolName, parseArgs, reportedCost, splitThinkTags, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
 
 /** OpenAI 兼容 Chat Completions（tools / tool_calls / role=tool） */
 function toMessages(system: string, turns: Turn[]) {
@@ -58,14 +58,16 @@ export const openaiChatAdapter: ProtocolAdapter = {
     const choice = json?.choices?.[0];
     if (!choice?.message) throw new ProviderError('parse', '响应中缺少 choices[0].message');
     const message = choice.message;
+    const allowedTools = new Set(ctx.tools.map((tool) => tool.name));
     const normalizedCalls = (Array.isArray(message.tool_calls) ? message.tool_calls : [])
       .map((c: any, i: number) => {
-        const name = normalizeToolName(c?.function?.name);
+        const name = normalizeToolName(c?.function?.name, allowedTools);
         if (!name) return null;
         return {
           ...c,
           id: normalizeToolCallId(c?.id, `chat_call_${i}`),
           type: c.type ?? 'function',
+          originalArguments: c?.function?.arguments,
           function: { ...c.function, name, arguments: normalizeArguments(c?.function?.arguments) },
         };
       })
@@ -74,11 +76,12 @@ export const openaiChatAdapter: ProtocolAdapter = {
       id: c.id,
       name: String(c.function.name),
       ...parseArgs(c.function.arguments),
+      ...(argumentsError(c.originalArguments) ? { args: null, argsError: argumentsError(c.originalArguments) } : {}),
     }));
     // 缺少 id 的工具调用补齐；没有函数名的 malformed call 不回放，避免下一轮缺少对应 tool result。
     const raw = {
       ...message,
-      tool_calls: normalizedCalls.length ? normalizedCalls : undefined,
+      tool_calls: normalizedCalls.length ? normalizedCalls.map(({ originalArguments: _originalArguments, ...call }) => call) : undefined,
     };
     // 思考字段：DeepSeek / Kimi / Qwen 等用 reasoning_content，OpenRouter / Ollama 等用 reasoning；也可能以 <think> 写在正文
     const own = [message.reasoning_content, message.reasoning].find((v) => typeof v === 'string' && v.trim()) ?? '';

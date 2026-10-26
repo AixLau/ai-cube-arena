@@ -119,6 +119,14 @@ const server = http.createServer((req, res) => {
       const args = { moves: callNo === 1 ? moves.slice(0, 1) : moves.slice(1) };
       return json(200, { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null, tool_calls: [{ id: `object_args_${callNo}`, type: 'function', function: { name: 'rotate_cube', arguments: args } }] } }] });
     }
+    if (url.startsWith('/malformed/') && url.endsWith('/chat/completions')) {
+      const callNo = mock.calls.filter((c) => c.path === url).length;
+      const args = callNo === 1 ? '{moves:[R]}' : JSON.stringify({ moves });
+      return json(200, { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null, tool_calls: [{ id: `malformed_${callNo}`, type: 'function', function: { name: 'rotate_cube', arguments: args } }] } }] });
+    }
+    if (url.startsWith('/unknown-tool/') && url.endsWith('/chat/completions')) {
+      return json(200, { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null, tool_calls: [{ id: 'unknown_tool', type: 'function', function: { name: 'move_center_piece', arguments: JSON.stringify({ moves: ['R'] }) } }] } }] });
+    }
     if (url.startsWith('/notoolloop/') && url.endsWith('/chat/completions')) {
       return json(200, { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: '我还在思考' } }] });
     }
@@ -865,6 +873,28 @@ test('arguments 规范化：Chat adapter 将 object arguments 转成 JSON 字符
   assert.equal(run.contestants[0].status, 'solved');
   const calls = mock.calls.filter((c) => c.path.startsWith('/objectargs/'));
   assert.equal(typeof calls[1].body.messages.find((m: any) => m.role === 'assistant').tool_calls[0].function.arguments, 'string');
+});
+
+test('malformed arguments：非法 JSON 不会进入下一轮 replay', async () => {
+  const cfg = await makeProvider({ name: 'malformed', baseUrl: `${base}/malformed/v1` });
+  mock.calls = [];
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  assert.equal(run.contestants[0].status, 'solved');
+  const calls = mock.calls.filter((c) => c.path.startsWith('/malformed/'));
+  const replayCall = calls[1].body.messages.find((m: any) => m.role === 'assistant');
+  assert.equal(replayCall.tool_calls[0].function.arguments, '{}');
+});
+
+test('unknown tool：未声明工具不会进入下一轮 provider replay', async () => {
+  const cfg = await makeProvider({ name: 'unknown-tool', baseUrl: `${base}/unknown-tool/v1` });
+  mock.calls = [];
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS });
+  await run.start();
+  assert.equal(run.contestants[0].status, 'failed');
+  const calls = mock.calls.filter((c) => c.path.startsWith('/unknown-tool/'));
+  assert.ok(calls.every((c) => !JSON.stringify(c.body).includes('move_center_piece')));
 });
 
 test('上下文硬预算：系统与工具定义已占满预算时不发送超预算请求', async () => {

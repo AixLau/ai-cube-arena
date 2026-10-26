@@ -52,12 +52,13 @@ export const anthropicAdapter: ProtocolAdapter = {
     if (!Array.isArray(json?.content)) throw new ProviderError('parse', '响应中缺少 content 数组（该地址可能不是 Anthropic 协议）');
     const toolCalls: ToolCall[] = [];
     const normalizedContent: any[] = [];
+    const allowedTools = new Set(ctx.tools.map((tool) => tool.name));
     let text = '';
     const thoughts: string[] = [];
     for (const b of json.content) {
       if (b.type === 'tool_use') {
         const ok = b.input && typeof b.input === 'object' && !Array.isArray(b.input);
-        const name = normalizeToolName(b.name);
+        const name = normalizeToolName(b.name, allowedTools);
         if (!name) continue;
         const id = normalizeToolCallId(b.id, `anthropic_call_${toolCalls.length}`);
         normalizedContent.push({ ...b, id, name, input: ok ? b.input : {} });

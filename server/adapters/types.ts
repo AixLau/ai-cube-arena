@@ -46,6 +46,10 @@ export interface TurnResult {
   forcedToolSupported?: boolean;
 }
 
+export class DeadlineExceededError extends Error {
+  constructor() { super('运行时间已到期'); }
+}
+
 export interface CallContext {
   config: ProviderConfig;
   model: string;
@@ -86,18 +90,34 @@ export function normalizeToolCallId(raw: unknown, prefix: string): string {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : `${prefix}_${randomUUID()}`;
 }
 
-export function normalizeToolName(raw: unknown): string | null {
-  return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+export function normalizeToolName(raw: unknown, allowed?: ReadonlySet<string>): string | null {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const name = raw.trim();
+  return allowed && !allowed.has(name) ? null : name;
 }
 
 /** 将 provider 可能返回的 object arguments 规范化为协议回放所需的 JSON 字符串。 */
 export function normalizeArguments(raw: unknown): string {
-  if (typeof raw === 'string') return raw;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? raw : '{}';
+    } catch { return '{}'; }
+  }
   try { return JSON.stringify(raw ?? {}); } catch { return '{}'; }
 }
 
+export function argumentsError(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? undefined : '工具参数不是 JSON 对象';
+  } catch { return '工具参数不是合法 JSON'; }
+}
+
 export function contextTimeout(ctx: Pick<CallContext, 'timeoutMs' | 'deadlineMs'>): number | null {
-  const remaining = ctx.deadlineMs == null ? null : Math.max(1, ctx.deadlineMs - Date.now());
+  const remaining = ctx.deadlineMs == null ? null : ctx.deadlineMs - Date.now();
+  if (remaining !== null && remaining <= 0) throw new DeadlineExceededError();
   if (remaining === null) return ctx.timeoutMs;
   return ctx.timeoutMs == null ? remaining : Math.min(ctx.timeoutMs, remaining);
 }
