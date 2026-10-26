@@ -246,23 +246,35 @@ export class Contestant {
   private async executeTool(call: ToolCall): Promise<{ content: string; moves: string[]; ok: boolean; error?: string }> {
     const stateResult = () => {
       const s = describeState(this.state);
-      return { moves_used: this.stats.moves, correct_stickers: `${s.correct}/${s.total}`, state: { net: s.net, faces: s.faces } };
+      return {
+        moves_used: this.stats.moves,
+        correct_stickers: `${s.correct}/${s.total}`,
+        state: { encoding: s.encoding, size: s.size, net: s.net, faces: s.faces, state_hash: s.hash, move_count: this.stats.moves },
+      };
     };
-    const reject = (error: string) => {
+    const reject = (code: string, message: string, retryable = true) => {
       this.stats.invalidToolCalls++;
-      return { content: JSON.stringify({ ok: false, error, executed: [], ...stateResult() }), moves: [], ok: false, error };
+      const result = {
+        ok: false,
+        solved: isSolved(this.state),
+        applied_moves: [],
+        executed: [],
+        error: { code, message, retryable },
+        ...stateResult(),
+      };
+      return { content: JSON.stringify(result), moves: [], ok: false, error: message };
     };
-    if (call.name !== 'rotate_cube') return reject(`未知工具 ${call.name}，只能调用 rotate_cube`);
-    if (!call.args) return reject(call.argsError ?? '工具参数无法解析');
+    if (call.name !== 'rotate_cube') return reject('UNKNOWN_TOOL', `未知工具 ${call.name}，只能调用 rotate_cube`);
+    if (!call.args) return reject('INVALID_ARGUMENTS', call.argsError ?? '工具参数无法解析');
     const raw = (call.args as { moves?: unknown }).moves;
     const tokens = Array.isArray(raw) ? raw.map(String) : typeof raw === 'string' ? raw.split(/[\s,]+/).filter(Boolean) : null;
-    if (!tokens || !tokens.length) return reject('moves 必须是非空数组，例如 ["R", "U\'"]');
+    if (!tokens || !tokens.length) return reject('EMPTY_MOVES', 'moves 必须是非空数组，例如 ["R", "U\'"]');
     if (tokens.length > this.run.limits.maxMovesPerCall) {
-      return reject(`单次最多 ${this.run.limits.maxMovesPerCall} 步，本次 ${tokens.length} 步，已拒绝`);
+      return reject('TOO_MANY_MOVES', `单次最多 ${this.run.limits.maxMovesPerCall} 步，本次 ${tokens.length} 步，已拒绝`);
     }
     const moves = tokens.map((t) => parseMove(t));
     const bad = tokens.filter((_, i) => !moves[i]);
-    if (bad.length) return reject(`非法记号：${bad.join(' ')}，整次调用未执行`);
+    if (bad.length) return reject('INVALID_MOVE', `非法记号：${bad.join(' ')}，整次调用未执行`);
 
     const executed: string[] = [];
     for (const m of moves as Move[]) {
@@ -284,20 +296,22 @@ export class Contestant {
     return {
       content: JSON.stringify({
         ok: true,
-        executed,
         solved,
+        error: null,
+        applied_moves: executed,
+        executed,
         moves_used: this.stats.moves,
         correct_stickers: `${s.correct}/${s.total}`,
-        state: { net: s.net, faces: s.faces },
+        state: { encoding: s.encoding, size: s.size, net: s.net, faces: s.faces, state_hash: s.hash, move_count: this.stats.moves },
       }),
       moves: executed,
       ok: true,
     };
   }
 
-  /** 当前状态是事实来源；调用循环只回放上一轮协议交互，避免历史线性增长。 */
+  /** 当前 canonical state 是事实来源；每轮追加最新状态与原始协议块。 */
   private stateTurn(memory: TurnMemory): Turn {
-    return { role: 'user', text: turnMessage(this.state, memory) };
+    return { role: 'user', text: turnMessage(this.state, { ...memory, movesUsed: this.stats.moves }) };
   }
 
   async start() {
@@ -339,15 +353,15 @@ export class Contestant {
     const endpoint = resolveEndpoint(config.protocol, config.baseUrl, this.model);
     const tools = [rotateCubeTool(limits, this.run.cubeSize)];
     const system = systemPrompt(limits, this.run.cubeSize);
-    // 只保留上一轮交互，避免完整历史线性增长，同时让推理模型能沿用刚完成的工具调用上下文。
+    // 保留原始 assistant/tool 协议块，当前 canonical state 作为最新 user 事实追加。
+    // 适配器负责把统一事件转换为供应商格式，不能在循环中重置历史。
     const recent: CallRecap[] = [];
     let plan: TurnMemory['plan'] = null;
     const remember = (r: CallRecap) => {
       recent.push(r);
       if (recent.length > RECENT_CALLS_SHOWN) recent.shift();
     };
-    let previousStateTurn: Turn = this.stateTurn({ recent, plan });
-    let turns: Turn[] = [previousStateTurn];
+    let turns: Turn[] = [this.stateTurn({ recent, plan })];
     const continueFrom = (
       result: TurnResult,
       toolResults: { callId: string; name: string; content: string }[],
@@ -355,19 +369,17 @@ export class Contestant {
     ) => {
       const nextStateTurn = this.stateTurn(memory);
       const assistantTurn: Turn = { role: 'assistant', text: result.text, toolCalls: result.toolCalls, raw: result.raw };
-      turns = [
-        previousStateTurn,
-        assistantTurn,
-        ...(toolResults.length ? [{ role: 'tool', results: toolResults } satisfies Turn] : []),
-        nextStateTurn,
-      ];
-      previousStateTurn = nextStateTurn;
+      turns.push(assistantTurn);
+      if (toolResults.length) turns.push({ role: 'tool', results: toolResults });
+      turns.push(nextStateTurn);
     };
     // 上一轮没有调用工具时，下一次请求要求必须调用工具；供应商不支持时整局回退为 auto
     let forceTool = false;
     let canForceTool = true;
     let noToolStreak = 0;
+    let noProgressStreak = 0;
     let invalidToolStreak = 0;
+    let lastStateHash = describeState(this.state).hash;
     const limiter = credentialLimiter(hostOf(endpoint), apiKey, config.maxConcurrentRequests);
     try {
       for (;;) {
@@ -464,7 +476,7 @@ export class Contestant {
           this.recordCall(result, []);
           this.emitStats();
           noToolStreak++;
-          if (noToolStreak >= 3) return this.setStatus('failed', '连续 3 次未调用工具');
+          if (noToolStreak >= limits.maxNoToolCalls) return this.setStatus('failed', `连续 ${limits.maxNoToolCalls} 次未调用工具`);
           forceTool = true;
           remember({ n, moves: [], error: '未调用工具' });
           continueFrom(
@@ -487,7 +499,16 @@ export class Contestant {
             ? (() => {
                 const s = describeState(this.state);
                 return {
-                  content: JSON.stringify({ ok: false, error: blocked, executed: [], moves_used: this.stats.moves, correct_stickers: `${s.correct}/${s.total}`, state: { net: s.net, faces: s.faces } }),
+                  content: JSON.stringify({
+                    ok: false,
+                    solved: true,
+                    applied_moves: [],
+                    executed: [],
+                    moves_used: this.stats.moves,
+                    correct_stickers: `${s.correct}/${s.total}`,
+                    state: { encoding: s.encoding, size: s.size, net: s.net, faces: s.faces, state_hash: s.hash, move_count: this.stats.moves },
+                    error: { code: 'ALREADY_SOLVED', message: blocked, retryable: false },
+                  }),
                   moves: [], ok: false, error: blocked,
                 };
               })()
@@ -504,7 +525,12 @@ export class Contestant {
         if (newPlan) plan = { n, text: newPlan };
         const rejected = summaries.filter((s) => !s.ok).map((s) => s.error ?? '未知错误');
         invalidToolStreak = summaries.length > 0 && summaries.every((s) => !s.ok) ? invalidToolStreak + 1 : 0;
-        if (invalidToolStreak >= 3) return this.setStatus('failed', '连续 3 次工具调用无效');
+        if (invalidToolStreak >= limits.maxNoProgressCalls) return this.setStatus('failed', `连续 ${limits.maxNoProgressCalls} 次工具调用无效`);
+        const currentStateHash = describeState(this.state).hash;
+        if (currentStateHash === lastStateHash) noProgressStreak++;
+        else noProgressStreak = 0;
+        lastStateHash = currentStateHash;
+        if (noProgressStreak >= limits.maxNoProgressCalls) return this.setStatus('failed', `连续 ${limits.maxNoProgressCalls} 次状态没有变化`);
         remember({ n, moves: summaries.flatMap((s) => s.moves), error: rejected.join('；') || undefined });
         continueFrom(result, toolResults, { recent, plan, notes: result.truncated ? [TRUNCATED_NOTE] : [] });
       }

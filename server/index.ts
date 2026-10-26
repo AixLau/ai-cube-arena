@@ -119,6 +119,8 @@ app.post('/api/runs', wrap(async (req, res) => {
     maxDurationSec: clamp(limits.maxDurationSec, 10, 7200, DEFAULT_LIMITS.maxDurationSec),
     maxApiCalls: clamp(limits.maxApiCalls, 1, 1000, DEFAULT_LIMITS.maxApiCalls),
     maxMovesPerCall: clamp(limits.maxMovesPerCall, 1, 50, DEFAULT_LIMITS.maxMovesPerCall),
+    maxNoToolCalls: clamp(limits.maxNoToolCalls, 1, 20, DEFAULT_LIMITS.maxNoToolCalls),
+    maxNoProgressCalls: clamp(limits.maxNoProgressCalls, 1, 20, DEFAULT_LIMITS.maxNoProgressCalls),
     concurrency: clamp(limits.concurrency, 1, 64, DEFAULT_LIMITS.concurrency),
     requestTimeoutSec: clamp(limits.requestTimeoutSec, 10, 600, DEFAULT_LIMITS.requestTimeoutSec),
   };

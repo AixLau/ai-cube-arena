@@ -169,6 +169,10 @@ export interface RunLimits {
   maxApiCalls: number;
   /** 单次 rotate_cube 调用最多包含的转动数 */
   maxMovesPerCall: number;
+  /** 连续没有产生工具调用时允许的最大轮数 */
+  maxNoToolCalls: number;
+  /** 连续调用后 canonical state 未变化时允许的最大轮数 */
+  maxNoProgressCalls: number;
   /** 同时运行的模型数 */
   concurrency: number;
   /** 单次 API 请求超时（秒） */
@@ -179,6 +183,8 @@ export const DEFAULT_LIMITS: RunLimits = {
   maxDurationSec: 600,
   maxApiCalls: 60,
   maxMovesPerCall: 10,
+  maxNoToolCalls: 3,
+  maxNoProgressCalls: 3,
   concurrency: 4,
   requestTimeoutSec: 120,
 };

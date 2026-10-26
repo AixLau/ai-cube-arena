@@ -17,7 +17,7 @@ const { testConnection } = await import('./providers/test.ts');
 const { Run, runs } = await import('./arena/run.ts');
 const { DIFFICULTIES, DEFAULT_LIMITS } = await import('../shared/types.ts');
 const { invertAlg, formatAlg, parseAlg, applyMoves, solvedState } = await import('../shared/cube.ts');
-const { rotateCubeTool, turnMessage } = await import('./arena/prompt.ts');
+const { rotateCubeTool, systemPrompt, turnMessage } = await import('./arena/prompt.ts');
 
 const withEnv = async (vars: Record<string, string | undefined>, fn: () => unknown) => {
   const old = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
@@ -88,6 +88,18 @@ const server = http.createServer((req, res) => {
     }
     if (url.startsWith('/nochoice/') && body.tool_choice === 'required') {
       return json(400, { error: { message: "tool_choice 'required' is not supported by this model" } });
+    }
+    if (url.startsWith('/stuck/') && url.endsWith('/chat/completions')) {
+      return json(200, {
+        choices: [{
+          finish_reason: 'tool_calls',
+          message: {
+            role: 'assistant',
+            content: null,
+            tool_calls: [{ id: `stuck${mock.calls.length}`, type: 'function', function: { name: 'rotate_cube', arguments: JSON.stringify({ moves: ['U', 'U', 'U', 'U'] }) } }],
+          },
+        }],
+      });
     }
     if (url.startsWith('/notoolloop/') && url.endsWith('/chat/completions')) {
       return json(200, { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: '我还在思考' } }] });
@@ -420,13 +432,18 @@ test('多模型同题评测：同一初始状态、独立状态、真正并发�
   for (const c of mock.calls) assert.ok(!JSON.stringify(c.body).includes(scramble), '请求中不应出现打乱公式');
   // 请求中不出现其它选手或服务端的密钥以外的内容：Authorization 正确
   assert.equal(first[0].headers.authorization, 'Bearer sk-test-1234567890abcdef');
-  // 只回放上一轮交互，不能把完整对话历史按轮次累加
+  // 协议适配器保留必要的上一轮工具关联；长历史由专门的回放测试覆盖
   const wrongCalls = mock.calls.filter((c) => c.path.startsWith('/wrong/') && c.path.endsWith('/chat/completions'));
   assert.ok(wrongCalls.length >= 2);
   assert.ok(wrongCalls.every((c) => {
     const history = c.body.messages.filter((m: any) => m.role === 'assistant' || m.role === 'tool');
     return history.length <= 2 && c.body.messages.length <= 5;
   }));
+  const rejectedResult = JSON.parse(wrongCalls[1].body.messages.find((m: any) => m.role === 'tool').content);
+  assert.deepEqual(rejectedResult.error, { code: 'INVALID_MOVE', message: "非法记号：X'，整次调用未执行", retryable: true });
+  assert.equal(rejectedResult.applied_moves.length, 0);
+  assert.equal(rejectedResult.solved, false);
+  assert.ok(rejectedResult.state.state_hash);
   assert.match(wrongCalls[1].body.messages.at(-1).content, /最近的调用[\s\S]*#1 未执行：非法记号/);
   // 事件中不出现密钥
   assert.ok(!JSON.stringify(run.events).includes('sk-test-1234567890abcdef'));
@@ -486,10 +503,9 @@ test('不限制总旋转次数：超过 200 步后仍可继续并复原', async 
   assert.equal(c.status, 'solved');
   assert.equal(c.stats.moves, 260 + mock.solution.length);
   const spinCalls = mock.calls.filter((x) => x.path.startsWith('/spin/') && x.path.endsWith('/chat/completions'));
-  assert.ok(spinCalls.every((x) => {
-    const history = x.body.messages.filter((m: any) => m.role === 'assistant' || m.role === 'tool');
-    return history.length <= 2 && x.body.messages.length <= 5;
-  }), '长评测不能回放完整对话历史');
+  const latestSpin = spinCalls.at(-1)!;
+  const spinHistory = latestSpin.body.messages.filter((m: any) => m.role === 'assistant' || m.role === 'tool');
+  assert.ok(spinHistory.length > 2, '长评测应保留完整 assistant/tool 历史');
 });
 
 test('供应商：保存后自动获取模型列表；不支持列表时可手动补充', async () => {
@@ -587,7 +603,7 @@ test('强制工具调用被拒绝：回退为 auto 继续，不误判为推理�
   assert.ok(run.contestants[0].trace.some((t) => t.type === 'log' && /强制工具调用/.test(t.text)));
 });
 
-test('每轮记忆：模型记下的计划与最近调用的效果带到下一轮，只回放上一轮交互', async () => {
+test('每轮记忆：模型记下的计划与最近调用的效果带到下一轮，并保留原始协议历史', async () => {
   const cfg = await makeProvider({ name: 'planner', baseUrl: `${base}/planner/v1` });
   mock.calls = [];
   const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS });
@@ -598,13 +614,13 @@ test('每轮记忆：模型记下的计划与最近调用的效果带到下一�
   const sent = mock.calls.filter((x) => x.path.startsWith('/planner/'));
   assert.equal(sent.length, 2);
   assert.equal(sent[0].body.tools[0].function.parameters.properties.plan.type, 'string');
-  assert.match(sent[0].body.messages[1].content, /还没有记下计划/);
+  assert.match(sent[0].body.messages[1].content, /当前没有模型备注/);
   const second = sent[1].body.messages;
-  assert.equal(second.length, 5, '只回放上一轮交互，不累加完整历史');
+  assert.equal(second.length, 5, '第二轮包含初始状态、assistant/tool 原始块和最新状态');
   assert.equal(second.filter((m: any) => m.role === 'assistant' || m.role === 'tool').length, 2);
   assert.ok(second.at(-1).content.includes(`最近的调用（从旧到新）：\n#1 ${mock.solution[0]}\n`));
   assert.ok(!/已归位|变好|变差|撤销/.test(second.at(-1).content), '只给状态与事实，不评价进展');
-  assert.ok(second.at(-1).content.includes(`你在第 1 次调用时记下的计划：接下来：${mock.solution.slice(1).join(' ')}`));
+  assert.ok(second.at(-1).content.includes(`模型在第 1 次调用时记下的备注（仅供参考）：接下来：${mock.solution.slice(1).join(' ')}`));
   const firstCall = contestant.trace.find((t) => t.type === 'call') as any;
   assert.equal(firstCall.plan, `接下来：${mock.solution.slice(1).join(' ')}`);
 });
@@ -684,6 +700,16 @@ test('运行预算：达到 API 调用上限和连续无工具上限时失败', 
   mock.delayMs = 0;
 });
 
+test('看门狗：canonical state 连续不变时按无进展预算确定性失败', async () => {
+  const cfg = await makeProvider({ name: 'stuck', baseUrl: `${base}/stuck/v1` });
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS, maxNoProgressCalls: 2 });
+  await run.start();
+  const contestant = run.contestants[0];
+  assert.equal(contestant.status, 'failed');
+  assert.match(contestant.failReason ?? '', /连续 2 次状态没有变化/);
+  assert.equal(contestant.snapshot().stats.moves, 8);
+});
+
 test('单局 concurrency 限制实际控制 in-flight 请求数', async () => {
   const configs = await Promise.all([1, 2, 3, 4].map((i) => makeProvider({ name: `run-limit-${i}`, baseUrl: `${base}/limited/v1` })));
   mock.calls = [];
@@ -700,23 +726,38 @@ test('单局 concurrency 限制实际控制 in-flight 请求数', async () => {
 test('工具契约按魔方阶数和单次动作上限生成 schema', () => {
   const tool = rotateCubeTool({ ...DEFAULT_LIMITS, maxMovesPerCall: 3 }, 4);
   assert.match(tool.description, /4x4x4/);
+  assert.match(tool.description, /canonical state/);
   const moves = tool.parameters.properties as any;
   assert.equal(moves.moves.minItems, 1);
   assert.equal(moves.moves.maxItems, 3);
   assert.equal(moves.moves.items.enum.length, 18);
+  assert.equal(tool.parameters.additionalProperties, false);
+  assert.equal(moves.plan.maxLength, 600);
+});
+
+test('系统提示按结构化区块表达状态、工具、错误和终止契约', () => {
+  const prompt = systemPrompt({ ...DEFAULT_LIMITS, maxNoToolCalls: 2, maxNoProgressCalls: 4 }, 4);
+  for (const block of ['<role>', '<objective>', '<runtime_limits>', '<state_contract>', '<tool_policy>', '<loop>', '<error_recovery>', '<termination>', '<response_policy>']) {
+    assert.ok(prompt.includes(block), block);
+  }
+  assert.match(prompt, /连续无工具阈值：2/);
+  assert.match(prompt, /连续无进展阈值：4/);
+  assert.match(prompt, /只有工具返回 solved=true 才算成功/);
 });
 
 test('每轮记忆：只给当前状态、最近执行的动作和模型自己的计划，不评价进展', () => {
   const state = applyMoves(solvedState(3), parseAlg('R U'));
   const first = turnMessage(state, { recent: [], plan: null });
   assert.ok(first.includes('展开图：') && first.includes('逐面格子：'));
+  assert.match(first, /state_hash/);
+  assert.match(first, /canonical state/);
   assert.ok(!first.includes('最近的调用'));
   const msg = turnMessage(state, {
     recent: [{ n: 3, moves: ['F'] }, { n: 4, moves: ['U2', 'R', 'U', "R'"] }, { n: 5, moves: [], error: '非法记号：X，整次调用未执行' }],
     plan: { n: 4, text: '插入 DFR 角块' },
   });
   assert.ok(msg.includes("最近的调用（从旧到新）：\n#3 F\n#4 U2 R U R'\n#5 未执行：非法记号：X，整次调用未执行"));
-  assert.ok(msg.includes('你在第 4 次调用时记下的计划：插入 DFR 角块'));
+  assert.ok(msg.includes('模型在第 4 次调用时记下的备注（仅供参考）：插入 DFR 角块'));
   assert.ok(!/已归位|变好|变差|撤销/.test(msg), '不告诉模型变好还是变差');
   const noTool = turnMessage(state, { recent: [{ n: 2, moves: [], error: '未调用工具' }], plan: null, notes: ['请调用工具'] });
   assert.ok(noTool.includes('#2 未执行：未调用工具'));

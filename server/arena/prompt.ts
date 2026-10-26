@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { ALL_MOVES, correctStickers, stateToFaceList, stateToNet, type CubeState } from '../../shared/cube.ts';
 import type { RunLimits } from '../../shared/types.ts';
 import type { ToolSpec } from '../adapters/types.ts';
@@ -5,30 +6,26 @@ import type { ToolSpec } from '../adapters/types.ts';
 /** 魔方状态编码规范版本：所有参赛模型使用同一规范 */
 export const STATE_ENCODING = 'facelet-net-v1';
 
-/**
- * 建议的单次动作数：不强制。已确定的公式应尽量一次提交，减少昂贵的
- * 往返请求；只有在动作依赖新状态或仍不确定时才拆成小段。
- */
-export const SUGGESTED_MOVES_PER_CALL = 20;
-
-/**
- * 每轮只回放上一轮协议所需的 assistant/tool 交互，并附上当前状态、最近几次调用
- * 的事实和模型自己记下的计划；上下文长度保持固定。系统不评价进展好坏，由模型根据状态自行判断。
- */
+/** 最近事实摘要只用于帮助模型定位；canonical state 和原始协议历史由编排器维护。 */
 export const RECENT_CALLS_SHOWN = 6;
 export const MAX_PLAN_CHARS = 600;
+
+export function stateHash(state: CubeState): string {
+  return createHash('sha256').update(state.join('')).digest('hex').slice(0, 16);
+}
 
 export function rotateCubeTool(limits: RunLimits, n = 3): ToolSpec {
   return {
     name: 'rotate_cube',
     description:
-      `Rotate the outer faces of the ${n}x${n}x${n} cube. Executes the given moves in order and returns the new cube state. ` +
-      `Allowed moves: R L U D F B (90° clockwise looking at that face), with ' for counter-clockwise and 2 for 180°. ` +
-      `At most ${limits.maxMovesPerCall} moves may be supplied in one call. ` +
-      `Put your sub-goal and remaining planned moves in "plan" so they remain available on the next turn. ` +
-      `If any move is invalid, the whole call is rejected and nothing is executed.`,
+      `目的：执行一组按顺序排列的合法外层旋转，并返回执行后的完整 canonical state。当前魔方为 ${n}x${n}x${n}。\n` +
+      `调用时机：只有在读取最近一次完整状态并确定下一小段动作后调用。moves 必须包含 1 到 ${limits.maxMovesPerCall} 个动作。\n` +
+      `约束：动作只能来自当前 schema 的 18 个记号。输入按整批校验；任一动作非法或参数无效时，整批拒绝且不执行任何动作，不得原样重试。\n` +
+      `输出：ok、solved、state（编码、尺寸、展开图、逐面格子、state_hash、动作计数）、applied_moves 和 error。\n` +
+      `错误：error.code 标识失败类别，error.message 说明修正方向，error.retryable 只表示修正输入后是否可以再次规划。最新工具结果优先于旧计划。`,
     parameters: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         moves: {
           type: 'array',
@@ -39,9 +36,8 @@ export function rotateCubeTool(limits: RunLimits, n = 3): ToolSpec {
         },
         plan: {
           type: 'string',
-          description:
-            `Recommended. Your current sub-goal and the moves you intend to make after this call (e.g. the rest of a solution you worked out). ` +
-            `Shown back to you on the next turn so you do not have to re-derive it. At most ${MAX_PLAN_CHARS} characters.`,
+          maxLength: MAX_PLAN_CHARS,
+          description: '可选：当前子目标和下一小段动作的简短备注；它不是事实来源，也不能替代最新状态。',
         },
       },
       required: ['moves'],
@@ -61,32 +57,79 @@ function orientationNote(n: number): string {
 export function systemPrompt(limits: RunLimits, n: number = 3): string {
   const name = ORDER_NAME[n] ?? `${n} 阶`;
   const rows = Array.from({ length: n }, (_, i) => `第${i + 1}行`).join('/');
-  return `你正在参加「AI 魔方能力评测」。你的任务：仅通过调用 rotate_cube 工具，把一个被打乱的${name}魔方（${n}×${n}×${n}）复原。
+  return `你是一个严格、可靠、以工具调用为核心的 AI 魔方求解 Agent。
 
-【评测规则】
-- 你只能通过 rotate_cube 工具转动魔方；系统按顺序执行你提供的动作后返回新状态。
-- 已确定的完整公式应尽量一次提交（最多 ${limits.maxMovesPerCall} 步）；只有下一步依赖新状态时才拆分，避免每次只转一步而增加请求往返。不要盲目提交很长的未知序列。
-- 历史对话不会完整回放；上一轮工具交互会按协议保留，当前状态、最近几次调用的事实和你在 rotate_cube 的 plan 参数会一并提供。把未执行的后续动作写进 plan，下一轮不必重新推导。
-- 不要用长篇文字代替工具调用；确定动作后直接调用 rotate_cube。
-- 只要包含一个非法记号，整次调用会被拒绝且不执行任何转动。
-- 单次调用最多 ${limits.maxMovesPerCall} 步；评测最多运行 ${limits.maxApiCalls} 次 API 调用、${limits.maxDurationSec} 秒，达到任一上限会结束本局。
-- 连续 3 次没有调用工具会判定本局失败。
-- 魔方复原（每个面颜色一致）的瞬间评测立即结束，无需再回复。用尽量少的步数复原。
+<role>
+你的职责是读取当前 canonical state，规划可验证的小段旋转，并通过 rotate_cube 改变魔方。实际旋转、成功判定和失败判定都由工具结果与编排器决定。
+</role>
 
-【坐标与配色】
-- 复原态配色：U=上(白) D=下(黄) F=前(绿) B=后(蓝) R=右(红) L=左(橙)。${orientationNote(n)}
-- 颜色字母：W白 Y黄 G绿 B蓝 R红 O橙。
+<objective>
+通过唯一的 rotate_cube 工具，将当前 ${n}×${n}×${n} 的${name}魔方完整复原。只有工具返回 solved=true 才算成功；收到 solved=true 后立即停止调用。
+不要只输出未执行的动作，不要根据过期状态声称已复原。
+</objective>
 
-【状态编码规范 ${STATE_ENCODING}】
-- 每个面是 ${n}×${n} 的格子，按行优先（左上→右下）列出，格式「面: ${rows}」。
-- F/R/B/L 面：正对该面观察，U 面在上方；U 面：从上往下看，F 面在下方；D 面：从下往上看，F 面在上方。
-- 展开图：U 在上，中间一行依次为 L F R B，D 在下。
+<runtime_limits>
+魔方尺寸：${n}×${n}×${n}
+单次最大动作数：${limits.maxMovesPerCall}
+最大 API 调用次数：${limits.maxApiCalls}
+最大运行时间：${limits.maxDurationSec} 秒
+连续无工具阈值：${limits.maxNoToolCalls}
+连续无进展阈值：${limits.maxNoProgressCalls}
+</runtime_limits>
 
-【转动记号】只允许 18 种外层转动：R L U D F B 表示正对该面把最外一层顺时针转 90°，加 ' 表示逆时针 90°，加 2 表示 180°。不允许 x/y/z、M/E/S、宽层（Rw / 小写）或内层转动。`;
+<state_contract>
+1. 最近一次完整工具结果中的 state 是唯一可信事实；其中 state_hash 用于判断状态是否变化。
+2. 不依赖过期内部记忆、旧计划或未经工具确认的推断。
+3. 每次工具调用后都根据最新完整状态重新识别阶段和下一步。
+4. 工具返回 ok=true 只表示调用被接受，不表示任务已成功；只有 solved=true 才能停止。
+5. 工具错误时，以错误结果中返回的最新 state 为准。
+</state_contract>
+
+<tool_policy>
+1. 所有实际旋转必须通过 rotate_cube 完成。
+2. moves 数量必须在 1 到 ${limits.maxMovesPerCall} 之间，且每个动作符合 schema。
+3. 整批拒绝视为零动作执行；修正输入或缩短批次后重新规划，不得原样重试。
+4. 不在普通文本中伪造已执行动作，不输出隐藏思维链或未经验证的长计划。
+</tool_policy>
+
+<planning_policy>
+先识别当前阶段和未完成部分，再规划一小段合法动作；优先保持已完成结构。确定性高时可提交较长但不超过上限的公式，不确定或刚发生错误时缩短批次。对大于 3×3 的魔方，分别处理中心、棱块配对和最后阶段。
+</planning_policy>
+
+<loop>
+读取完整状态 → 识别阶段 → 规划小段动作 → 调用 rotate_cube → 读取完整结果 → 检查 solved、state_hash、错误和预算 → solved=true 时停止，否则丢弃不再适用的旧计划并基于最新状态重新规划。
+</loop>
+
+<error_recovery>
+参数格式错误：修正字段后重试。动作数量超限：缩短批次。非法动作：从合法集合重新选择。整批拒绝：视为零动作执行，不原样重试。状态与预期不一致：丢弃旧计划，使用最新 state。连续 state_hash 不变：停止重复策略并重新识别阶段；达到无进展阈值时停止。
+</error_recovery>
+
+<termination>
+工具返回 solved=true、达到 API 调用或时间预算、连续无工具达到阈值、连续无进展达到阈值，或工具明确报告无法继续时，停止调用并报告最后一个工具状态。
+</termination>
+
+<response_policy>
+动作必须放在工具调用中。普通文本只提供简短状态更新；除非工具返回 solved=true，否则不要声称魔方已复原。成功时确认已复原，失败时说明最后状态、错误原因和剩余预算。
+</response_policy>
+
+<encoding>
+复原配色：U=上(白) D=下(黄) F=前(绿) B=后(蓝) R=右(红) L=左(橙)。${orientationNote(n)}
+状态编码 ${STATE_ENCODING}：每个面按行优先（左上→右下）列出，格式“面: ${rows}”；F/R/B/L 正对该面观察，U 从上往下看，D 从下往上看；展开图为 U / L F R B / D。
+只允许 R L U D F B 及其 '、2 后缀，不允许 x/y/z、M/E/S、宽层或内层转动。
+</encoding>`;
 }
 
-export function describeState(state: CubeState): { net: string; faces: string; correct: number; total: number } {
-  return { net: stateToNet(state), faces: stateToFaceList(state), correct: correctStickers(state), total: state.length };
+export function describeState(state: CubeState): { encoding: string; size: number; net: string; faces: string; hash: string; correct: number; total: number } {
+  const size = Math.sqrt(state.length / 6);
+  return {
+    encoding: STATE_ENCODING,
+    size,
+    net: stateToNet(state),
+    faces: stateToFaceList(state),
+    hash: stateHash(state),
+    correct: correctStickers(state),
+    total: state.length,
+  };
 }
 
 /** 一次模型调用实际执行的动作，用于后续几轮的提示（只陈述事实，不评价好坏） */
@@ -102,6 +145,8 @@ export interface TurnMemory {
   recent: CallRecap[];
   /** 模型最近一次写在 plan 参数里的计划，以及写下它的调用序号 */
   plan: { n: number; text: string } | null;
+  /** canonical state 中累计执行的动作数 */
+  movesUsed?: number;
   /** 附加提醒（未调用工具、输出被截断等） */
   notes?: string[];
 }
@@ -116,8 +161,11 @@ export function turnMessage(state: CubeState, memory: TurnMemory): string {
   const first = !memory.recent.length;
   const lines = [
     first
-      ? '这是本局魔方的初始状态，请开始调用 rotate_cube 复原。'
-      : '这是魔方的当前状态。历史对话不会完整回放；下面附上上一轮的必要交互、最近几次调用执行的动作和你自己记下的计划。',
+      ? '这是本局魔方的初始 canonical state，请开始调用 rotate_cube。'
+      : '这是最新 canonical state；请忽略旧计划，以最近工具结果为准。',
+    '',
+    '状态摘要（机器事实）：',
+    JSON.stringify({ encoding: s.encoding, size: s.size, state_hash: s.hash, solved: s.correct === s.total, moves_used: memory.movesUsed ?? null, correct_stickers: `${s.correct}/${s.total}` }),
     '',
     '展开图：',
     s.net,
@@ -129,11 +177,11 @@ export function turnMessage(state: CubeState, memory: TurnMemory): string {
   lines.push(
     '',
     memory.plan
-      ? `你在第 ${memory.plan.n} 次调用时记下的计划：${memory.plan.text}`
-      : '你还没有记下计划。想好多步解法后，可以在 rotate_cube 的 plan 参数里写下当前小目标和后续动作，下一轮会原样提供给你。',
+      ? `模型在第 ${memory.plan.n} 次调用时记下的备注（仅供参考）：${memory.plan.text}`
+      : '当前没有模型备注。备注不能替代工具返回的 state。',
   );
   if (memory.notes?.length) lines.push('', ...memory.notes);
-  if (!first) lines.push('', '请根据当前状态继续调用 rotate_cube。');
+  if (!first) lines.push('', '请根据这个最新状态继续调用 rotate_cube。');
   return lines.join('\n');
 }
 
