@@ -14,7 +14,7 @@ const { assertAllowedUrl, isBlockedIp, safeLookup } = await import('./security/u
 const { redact } = await import('./security/redact.ts');
 const { normalizeProvider, refreshProvider } = await import('./providers/store.ts');
 const { testConnection } = await import('./providers/test.ts');
-const { Run, runs } = await import('./arena/run.ts');
+const { Run, abortableDelay, positiveIntEnv, runs } = await import('./arena/run.ts');
 const { DIFFICULTIES, DEFAULT_LIMITS } = await import('../shared/types.ts');
 const { invertAlg, formatAlg, parseAlg, applyMoves, solvedState } = await import('../shared/cube.ts');
 const { rotateCubeTool, systemPrompt, turnMessage } = await import('./arena/prompt.ts');
@@ -65,6 +65,9 @@ const server = http.createServer((req, res) => {
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
     };
+    if (url.startsWith('/cancel-backoff/')) {
+      return json(503, { error: { message: 'temporary upstream failure' } });
+    }
     const moves = mock.solution;
     if (req.method === 'GET' && url.endsWith('/models')) {
       if (url.startsWith('/nolist/')) return json(404, { error: 'not found' });
@@ -114,6 +117,62 @@ const server = http.createServer((req, res) => {
           message: { role: 'assistant', content: null, tool_calls: [{ id: `p${mock.calls.length}`, type: 'function', function: { name: 'rotate_cube', arguments: JSON.stringify(args) } }] },
         }],
         usage: { prompt_tokens: 100, completion_tokens: 50 },
+      });
+    }
+    if (url.startsWith('/planner-2/') && body.tools?.[0]?.function?.name === 'rotate_cube') {
+      const callNo = mock.calls.filter((c) => c.path === url).length;
+      const responseMoves = callNo === 1 ? moves.slice(0, 1) : moves.slice(1);
+      return json(200, {
+        choices: [{
+          finish_reason: 'tool_calls',
+          message: { role: 'assistant', content: null, tool_calls: [{ id: `planner2_${callNo}`, type: 'function', function: { name: 'rotate_cube', arguments: JSON.stringify({ moves: responseMoves }) } }] },
+        }],
+      });
+    }
+    if (url.startsWith('/plan-clear/') && body.tools?.[0]?.function?.name === 'rotate_cube') {
+      const callNo = mock.calls.filter((c) => c.path === url).length;
+      const args = callNo === 1
+        ? { moves: moves.slice(0, 1), plan: '旧计划' }
+        : callNo === 2
+          ? { moves: moves.slice(1, 2) }
+          : { moves: moves.slice(2) };
+      return json(200, {
+        choices: [{
+          finish_reason: 'tool_calls',
+          message: { role: 'assistant', content: null, tool_calls: [{ id: `plan_clear_${callNo}`, type: 'function', function: { name: 'rotate_cube', arguments: JSON.stringify(args) } }] },
+        }],
+      });
+    }
+    if (url.startsWith('/planner-responses/') && url.endsWith('/responses')) {
+      const callNo = mock.calls.filter((c) => c.path === url).length;
+      const responseMoves = callNo === 1 ? moves.slice(0, 1) : moves.slice(1);
+      return json(200, {
+        status: 'completed',
+        output: [
+          { type: 'reasoning', id: `planner_rs_${callNo}`, summary: [{ type: 'summary_text', text: 'summary' }] },
+          { type: 'function_call', id: `planner_fc_${callNo}`, call_id: `planner_call_${callNo}`, name: 'rotate_cube', arguments: JSON.stringify({ moves: responseMoves }) },
+        ],
+      });
+    }
+    if (url.startsWith('/planner-anthropic/') && url.endsWith('/messages')) {
+      const callNo = mock.calls.filter((c) => c.path === url).length;
+      const responseMoves = callNo === 1 ? moves.slice(0, 1) : moves.slice(1);
+      return json(200, {
+        stop_reason: 'tool_use',
+        content: [
+          { type: 'thinking', thinking: `planner thinking ${callNo}`, signature: `sig_${callNo}` },
+          { type: 'tool_use', id: `planner_tu_${callNo}`, name: 'rotate_cube', input: { moves: responseMoves } },
+        ],
+      });
+    }
+    if (url.startsWith('/planner-gemini/') && url.includes(':generateContent')) {
+      const callNo = mock.calls.filter((c) => c.path === url).length;
+      const responseMoves = callNo === 1 ? moves.slice(0, 1) : moves.slice(1);
+      return json(200, {
+        candidates: [{
+          finishReason: 'STOP',
+          content: { role: 'model', parts: [{ text: `planner thought ${callNo}`, thought: true }, { functionCall: { name: 'rotate_cube', args: { moves: responseMoves }, id: `planner_gem_${callNo}` }, thoughtSignature: `sig_${callNo}` }] },
+        }],
       });
     }
     // chatty / nochoice：第一次请求只回复文字（chatty 的输出还被截断），思考写在 reasoning_content 与 <think> 中
@@ -343,12 +402,14 @@ test('HTTP 供应商接口：移除旧存储接口，环境变量不预置，每
       mock.solution = formatAlg(invertAlg(runs.get(id)!.scramble)).split(' ');
       const events = await (await fetch(`${origin}/api/runs/${id}/stream`)).text();
       assert.ok(!events.includes(config.apiKey));
+      assert.ok(!events.includes('thinking…'), 'SSE 默认不公开原始 reasoning');
       const exported = await (await fetch(`${origin}/api/runs/${id}/export`)).json() as {
         contestants: { status: string }[];
       };
       assert.equal(exported.contestants[0].status, 'solved');
       assert.ok(!JSON.stringify(exported).includes(config.apiKey));
       assert.ok(!JSON.stringify(exported).includes('baseUrl'));
+      assert.ok(!JSON.stringify(exported).includes('thinking…'), '导出默认不包含原始 reasoning');
     } finally {
       mock.delayMs = 0;
     }
@@ -416,6 +477,14 @@ test('多模型同题评测：同一初始状态、独立状态、真正并发�
   assert.equal(byName.nousage.stats.inputTokens, null);
   assert.equal(byName.nousage.stats.cost, null);
 
+  const publicSummary = run.publicSummary();
+  assert.equal('scramble' in publicSummary, false);
+  assert.equal('initialState' in publicSummary, false);
+  assert.deepEqual(run.events.map((e) => e.seq), run.events.map((_, i) => i + 1), '事件序号必须单调递增');
+  assert.equal(run.events[0].event.type, 'init');
+  const publicReasoning = Object.values(run.publicRecord().traces).flatMap((items) => items.filter((item: any) => item.type === 'call'));
+  assert.ok(publicReasoning.every((item: any) => !('reasoning' in item)), '公开运行记录不应包含原始 reasoning');
+
   // 思考内容：各协议的思考字段都提取到调用记录，正文不混入思考
   const firstCall = (name: string) => run.contestants.find((c) => c.info.name === name)!.trace.find((t) => t.type === 'call') as any;
   assert.equal(firstCall('chat').reasoning, 'thinking…');
@@ -429,6 +498,13 @@ test('多模型同题评测：同一初始状态、独立状态、真正并发�
   const first = mock.calls.filter((c) => c.path.endsWith('/chat/completions') && c.body.tools?.[0]?.function?.name === 'rotate_cube');
   const sys = new Set(first.map((c) => c.body.messages[0].content));
   assert.equal(sys.size, 1);
+  const geminiRequest = mock.calls.find((c) => c.path.includes(':generateContent'));
+  assert.ok(geminiRequest);
+  const geminiParameters = geminiRequest!.body.tools[0].functionDeclarations[0].parameters;
+  assert.equal(geminiParameters.additionalProperties, undefined);
+  assert.deepEqual(geminiParameters.properties.moves.items.enum.length, 18);
+  assert.equal(geminiParameters.properties.moves.minItems, 1);
+  assert.equal(geminiParameters.properties.moves.maxItems, DEFAULT_LIMITS.maxMovesPerCall);
   for (const c of mock.calls) assert.ok(!JSON.stringify(c.body).includes(scramble), '请求中不应出现打乱公式');
   // 请求中不出现其它选手或服务端的密钥以外的内容：Authorization 正确
   assert.equal(first[0].headers.authorization, 'Bearer sk-test-1234567890abcdef');
@@ -506,6 +582,8 @@ test('不限制总旋转次数：超过 200 步后仍可继续并复原', async 
   const latestSpin = spinCalls.at(-1)!;
   const spinHistory = latestSpin.body.messages.filter((m: any) => m.role === 'assistant' || m.role === 'tool');
   assert.ok(spinHistory.length > 2, '长评测应保留完整 assistant/tool 历史');
+  assert.ok(spinHistory.length <= DEFAULT_LIMITS.maxHistoryRounds * 2, '长评测应在上下文预算内压缩旧回合');
+  assert.ok(run.contestants[0].trace.some((item) => item.type === 'log' && /压缩/.test(item.text)));
 });
 
 test('供应商：保存后自动获取模型列表；不支持列表时可手动补充', async () => {
@@ -625,6 +703,19 @@ test('每轮记忆：模型记下的计划与最近调用的效果带到下一�
   assert.equal(firstCall.plan, `接下来：${mock.solution.slice(1).join(' ')}`);
 });
 
+test('工具备注：运行时截断并在后续未携带新备注时清除旧 plan', async () => {
+  const cfg = await makeProvider({ name: 'plan-clear', baseUrl: `${base}/plan-clear/v1` });
+  mock.calls = [];
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  assert.equal(run.contestants[0].status, 'solved');
+  const calls = mock.calls.filter((c) => c.path.startsWith('/plan-clear/'));
+  assert.equal(calls.length, 3);
+  assert.match(calls[1].body.messages.at(-1).content, /旧计划/);
+  assert.doesNotMatch(calls[2].body.messages.at(-1).content, /模型在第 \d+ 次调用时记下的备注.*旧计划/);
+});
+
 test('Responses API：保留一轮工具上下文、原始元数据并请求简洁推理摘要', async () => {
   const cfg = await makeProvider({ name: 'responses-memory', protocol: 'openai-responses', baseUrl: `${base}/responses-memory/v1` });
   mock.calls = [];
@@ -646,6 +737,40 @@ test('Responses API：保留一轮工具上下文、原始元数据并请求简�
   assert.match(output.output, /correct_stickers/);
   assert.match(output.output, /state/);
   assert.equal(sent[0].body.parallel_tool_calls, false);
+});
+
+test('四种协议：二轮以上回放保留工具关联、provider metadata 和最新状态', async () => {
+  const configs = [
+    await makeProvider({ name: 'planner-chat-2', baseUrl: `${base}/planner-2/v1` }),
+    await makeProvider({ name: 'planner-responses', protocol: 'openai-responses', baseUrl: `${base}/planner-responses/v1` }),
+    await makeProvider({ name: 'planner-anthropic', protocol: 'anthropic', baseUrl: `${base}/planner-anthropic`, authMode: 'x-api-key' }),
+    await makeProvider({ name: 'planner-gemini', protocol: 'gemini', baseUrl: `${base}/planner-gemini/v1beta`, authMode: 'x-goog-api-key' }),
+  ];
+  mock.calls = [];
+  const run = new Run(configs.map((c) => E(c)), D3, { ...DEFAULT_LIMITS, concurrency: 4 });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  for (const c of run.contestants) assert.equal(c.status, 'solved', c.info.name);
+
+  const chat = mock.calls.filter((c) => c.path.startsWith('/planner-2/') && c.path.endsWith('/chat/completions'));
+  assert.equal(chat.length, 2);
+  assert.ok(chat[1].body.messages.some((m: any) => m.role === 'tool'));
+  assert.ok(/state_hash/.test(chat[1].body.messages.at(-1).content));
+
+  const responses = mock.calls.filter((c) => c.path.startsWith('/planner-responses/') && c.path.endsWith('/responses'));
+  assert.equal(responses.length, 2);
+  assert.ok((responses[1].body.input as any[]).some((item) => item.type === 'function_call_output'));
+  assert.ok((responses[1].body.input as any[]).some((item) => item.role === 'user' && /state_hash/.test(item.content)));
+
+  const anthropic = mock.calls.filter((c) => c.path.startsWith('/planner-anthropic/') && c.path.endsWith('/messages'));
+  assert.equal(anthropic.length, 2);
+  assert.ok(anthropic[1].body.messages.some((m: any) => m.role === 'assistant' && m.content.some((b: any) => b.type === 'tool_use')));
+  assert.ok(anthropic[1].body.messages.some((m: any) => m.role === 'user' && m.content.some((b: any) => b.type === 'tool_result')));
+
+  const gemini = mock.calls.filter((c) => c.path.startsWith('/planner-gemini/') && c.path.includes(':generateContent'));
+  assert.equal(gemini.length, 2);
+  assert.ok(gemini[1].body.contents.some((content: any) => content.role === 'model' && content.parts.some((p: any) => p.functionCall)));
+  assert.ok(gemini[1].body.contents.some((content: any) => content.role === 'user' && content.parts.some((p: any) => p.functionResponse)));
 });
 
 test('Responses API：旧中转拒绝可选推理字段时回退到基础请求', async () => {
@@ -708,6 +833,54 @@ test('看门狗：canonical state 连续不变时按无进展预算确定性失�
   assert.equal(contestant.status, 'failed');
   assert.match(contestant.failReason ?? '', /连续 2 次状态没有变化/);
   assert.equal(contestant.snapshot().stats.moves, 8);
+});
+
+test('取消：retry backoff 可被 stop 立即打断', async () => {
+  const cfg = await makeProvider({ name: 'cancel-backoff', baseUrl: `${base}/cancel-backoff/v1` });
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS, maxDurationSec: 60 });
+  const started = Date.now();
+  const done = run.start();
+  for (let i = 0; i < 50 && !mock.calls.some((c) => c.path.startsWith('/cancel-backoff/')); i++) await new Promise((r) => setTimeout(r, 5));
+  run.contestants[0].stop('测试取消');
+  await done;
+  assert.equal(run.contestants[0].status, 'stopped');
+  assert.ok(Date.now() - started < 500, '停止不应等待退避计时器结束');
+});
+
+test('取消边界：暂停排队 contestant 不会在名额释放后直接发请求', async () => {
+  const configs = await Promise.all([
+    makeProvider({ name: 'pause-queue-a', baseUrl: `${base}/limited/v1`, maxConcurrentRequests: 1 }),
+    makeProvider({ name: 'pause-queue-b', baseUrl: `${base}/limited/v1`, maxConcurrentRequests: 1 }),
+  ]);
+  mock.calls = [];
+  mock.delayMs = 100;
+  const run = new Run(configs.map((c) => E(c)), D3, { ...DEFAULT_LIMITS, concurrency: 1 });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  const done = run.start();
+  for (let i = 0; i < 50 && mock.calls.filter((c) => c.path.startsWith('/limited/')).length < 1; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(run.contestants[1].status, 'queued');
+  assert.equal(run.contestants[1].pause(), true);
+  run.contestants[0].stop('释放排队名额');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(run.contestants[1].status, 'paused');
+  assert.equal(mock.calls.filter((c) => c.path.startsWith('/limited/')).length, 1);
+  run.contestants[1].resume();
+  await done;
+  assert.equal(run.contestants[1].status, 'solved');
+  mock.delayMs = 0;
+});
+
+test('运行配置：全局并发环境变量和可取消等待采用确定性边界', async () => {
+  assert.equal(positiveIntEnv('0', 16), 16);
+  assert.equal(positiveIntEnv('-1', 16), 16);
+  assert.equal(positiveIntEnv('1.5', 16), 16);
+  assert.equal(positiveIntEnv('3', 16), 3);
+  const controller = new AbortController();
+  const started = Date.now();
+  const waiting = abortableDelay(30_000, controller.signal);
+  controller.abort();
+  await assert.rejects(waiting);
+  assert.ok(Date.now() - started < 200);
 });
 
 test('单局 concurrency 限制实际控制 in-flight 请求数', async () => {

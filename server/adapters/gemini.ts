@@ -1,6 +1,21 @@
 import { authHeaders, postJson, ProviderError } from './http.ts';
 import { reportedCost, THINKING_BUDGET, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
 
+/** Gemini 的 function declaration 使用受限 Schema 子集；去掉通用 JSON Schema 专属字段。 */
+export function normalizeGeminiTool(tool: { name: string; description: string; parameters: Record<string, unknown> }) {
+  const sanitize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(sanitize);
+    if (!value || typeof value !== 'object') return value;
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (key === 'additionalProperties' || key === 'maxLength') continue;
+      out[key] = sanitize(child);
+    }
+    return out;
+  };
+  return { name: tool.name, description: tool.description, parameters: sanitize(tool.parameters) as Record<string, unknown> };
+}
+
 /** Google Gemini generateContent（functionCall / functionResponse） */
 function toContents(turns: Turn[]) {
   const contents: { role: 'user' | 'model'; parts: unknown[] }[] = [];
@@ -34,7 +49,7 @@ export const geminiAdapter: ProtocolAdapter = {
       contents: toContents(ctx.turns),
     };
     if (ctx.tools.length) {
-      body.tools = [{ functionDeclarations: ctx.tools }];
+      body.tools = [{ functionDeclarations: ctx.tools.map(normalizeGeminiTool) }];
       body.toolConfig = { functionCallingConfig: { mode: ctx.toolChoice === 'required' ? 'ANY' : 'AUTO' } };
     }
     const gen: Record<string, unknown> = {};

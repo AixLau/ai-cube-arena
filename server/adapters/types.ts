@@ -41,6 +41,8 @@ export interface TurnResult {
   finishReason: string | null;
   /** 输出达到最大输出 Token 被截断，工具调用可能缺失或参数不完整 */
   truncated: boolean;
+  /** 该协议是否支持 required/ANY 工具选择；未提供时视为支持。 */
+  forcedToolSupported?: boolean;
 }
 
 export interface CallContext {

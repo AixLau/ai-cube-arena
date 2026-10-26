@@ -8,7 +8,7 @@ import ModelAvatar from '../ModelAvatar.tsx';
 
 interface Props {
   c: LiveContestant;
-  scramble: string;
+  scramble: string | null;
   cubeSize: number;
   tempo: number;
   showHiddenFaces: boolean;
@@ -96,7 +96,7 @@ export default function LiveCard({ c, scramble, cubeSize, tempo, showHiddenFaces
 
       <div className="lc-body">
         <div className="lc-cube">
-          {showCube ? <CubeViewer ref={viewer} setupAlg={scramble} size={cubeSize} tempoScale={tempo} showHiddenFaces={showHiddenFaces} /> : <div className="cube-deferred"><b>3D 视图已暂停</b><span>模型数量较多，聚焦后加载</span></div>}
+          {showCube && scramble !== null ? <CubeViewer ref={viewer} setupAlg={scramble} size={cubeSize} tempoScale={tempo} showHiddenFaces={showHiddenFaces} /> : <div className="cube-deferred"><b>{scramble === null ? '初始状态暂不公开' : '3D 视图已暂停'}</b><span>{scramble === null ? '评测结束后可在报告中回放' : '模型数量较多，聚焦后加载'}</span></div>}
         </div>
         <dl className="lc-stats">
           <div className="lc-ring"><Ring value={progress} /><span>{status === 'solved' ? '已复原' : '面色一致度'}{status !== 'solved' && <small>会波动</small>}</span></div>

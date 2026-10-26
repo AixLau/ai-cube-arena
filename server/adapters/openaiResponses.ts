@@ -33,6 +33,10 @@ function toInput(turns: Turn[]) {
   return items;
 }
 
+function normalizeFunctionCallId(item: Record<string, any>, index: number): string {
+  return String(item.call_id ?? item.id ?? `responses_call_${Date.now()}_${index}`);
+}
+
 const reasoningSummaryUnsupported = new Set<string>();
 const encryptedReasoningUnsupported = new Set<string>();
 const reasoningEffortUnsupported = new Set<string>();
@@ -41,7 +45,8 @@ function optionalReasoningOption(error: unknown, option: 'summary' | 'encrypted'
   if (!(error instanceof ProviderError) || error.status !== 400) return false;
   const message = error.message;
   if (option === 'summary') return /reasoning(?:[._\s-])?summary\b/i.test(message);
-  return /\binclude\b|encrypted[_ .-]?content/i.test(message);
+  return /reasoning[._\s-]?encrypted[_ .-]?content|encrypted[_ .-]?content/i.test(message) ||
+    (/\binclude\b/i.test(message) && /unsupported|unrecognized|unknown|not supported/i.test(message));
 }
 
 function optionalReasoningEffort(error: unknown): boolean {
@@ -115,9 +120,14 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
     const toolCalls: ToolCall[] = [];
     let text = '';
     const thoughts: string[] = [];
-    for (const it of json.output) {
+    const rawOutput = (json.output as Record<string, any>[]).map((it, index) => {
+      if (it?.type !== 'function_call') return it;
+      const callId = normalizeFunctionCallId(it, index);
+      return { ...it, id: it.id ?? callId, call_id: callId };
+    });
+    for (const it of rawOutput) {
       if (it.type === 'function_call') {
-        toolCalls.push({ id: String(it.call_id ?? it.id), name: String(it.name), ...parseArgs(it.arguments) });
+        toolCalls.push({ id: String(it.call_id), name: String(it.name), ...parseArgs(it.arguments) });
       } else if (it.type === 'message') {
         text += (it.content ?? []).filter((c: any) => c.type === 'output_text').map((c: any) => c.text).join('');
       } else if (it.type === 'reasoning') {
@@ -130,7 +140,7 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
       text,
       reasoning: thoughts.join('\n\n'),
       toolCalls,
-      raw: json.output,
+      raw: rawOutput,
       finishReason: json.status ?? null,
       truncated: json.status === 'incomplete' && json.incomplete_details?.reason === 'max_output_tokens',
       usage: u

@@ -6,7 +6,7 @@ import {
 import { hostOf, resolveEndpoint } from '../../shared/endpoint.ts';
 import {
   TERMINAL_STATUSES, type ContestantInfo, type ContestantState, type ContestantStats, type ContestantStatus,
-  type Difficulty, type ProviderConfig, type ReasoningEffort, type RunEvent, type RunLimits, type RunRecord, type RunSummary, type TraceItem,
+  type Difficulty, type ProviderConfig, type ReasoningEffort, type RunEvent, type RunEventEnvelope, type RunLimits, type RunRecord, type RunSummary, type PublicRunRecord, type PublicRunSummary, type TraceItem,
 } from '../../shared/types.ts';
 import { ADAPTERS } from '../adapters/index.ts';
 import { ProviderError } from '../adapters/http.ts';
@@ -28,15 +28,23 @@ export class Semaphore {
       return true;
     }
     return new Promise<boolean>((resolve) => {
-      const grant = () => resolve(true);
-      this.waiters.push(grant);
-      signal?.addEventListener('abort', () => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
         const i = this.waiters.indexOf(grant);
-        if (i >= 0) {
-          this.waiters.splice(i, 1);
-          resolve(false);
-        }
-      }, { once: true });
+        if (i >= 0) this.waiters.splice(i, 1);
+        resolve(false);
+      };
+      const grant = () => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener('abort', onAbort);
+        resolve(true);
+      };
+      this.waiters.push(grant);
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
   release() {
@@ -46,8 +54,30 @@ export class Semaphore {
   }
 }
 
+export function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(new StopSignal());
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(new StopSignal());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /** 全局同时进行的模型会话上限，防止供应商限流与服务端过载 */
-export const globalSessions = new Semaphore(Number(process.env.MAX_ACTIVE_SESSIONS || 16));
+export function positiveIntEnv(value: string | undefined, fallback: number, max = 256): number {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 ? Math.min(n, max) : fallback;
+}
+
+export const globalSessions = new Semaphore(positiveIntEnv(process.env.MAX_ACTIVE_SESSIONS, 16));
 
 /** 同一密钥 + 同一主机共享的请求并发上限（键为哈希，内存中也不保存密钥原文） */
 const credentialLimiters = new Map<string, Semaphore>();
@@ -63,7 +93,7 @@ function credentialLimiter(host: string, apiKey: string | undefined, limit: numb
 const MAX_RETRIES = 2;
 /** 限流（429）的重试次数（不计入预算，但受最大运行时间约束） */
 const MAX_THROTTLE_RETRIES = 8;
-const EFFORT_PARAM_RE = /reasoning|effort|thinking|budget/i;
+const EFFORT_PARAM_RE = /reasoning[_ .-]?effort|thinking[_ .-]?budget|budget[_ .-]?tokens|thinkingConfig/i;
 const TOOL_CHOICE_PARAM_RE = /tool_choice|tool choice|function_?calling_?config|functionCallingConfig/i;
 const GENERIC_REJECT_RE = /unrecognized|unknown (field|param)|unsupported|not support|extra (fields|inputs)/i;
 /** 错误信息点名了这些字段时，泛化的「不支持」不归因到可选参数 */
@@ -78,7 +108,7 @@ function rejectedOptionalParam(err: ProviderError, sent: { effort: boolean; forc
   const m = err.message;
   const generic = GENERIC_REJECT_RE.test(m) && !OTHER_PARAM_RE.test(m);
   if (sent.forcedTool && (TOOL_CHOICE_PARAM_RE.test(m) || (generic && !EFFORT_PARAM_RE.test(m)))) return 'toolChoice';
-  if (sent.effort && (EFFORT_PARAM_RE.test(m) || generic)) return 'effort';
+  if (sent.effort && EFFORT_PARAM_RE.test(m) && (generic || /not (accepted|allowed|supported)|invalid parameter/i.test(m))) return 'effort';
   return null;
 }
 
@@ -107,6 +137,39 @@ const emptyStats = (state: CubeState): ContestantStats => ({
 
 class StopSignal extends Error {}
 
+/**
+ * 保留最近完整协议回合，避免 assistant/tool 关联被截断；更早状态由最新
+ * canonical state 和 recent recap 取代。每个回合形态为：state → assistant
+ * → (tool) → state，拼接时后续回合复用前一回合的 state 边界。
+ */
+function compactTurns(turns: Turn[], maxRounds: number, maxChars: number): { turns: Turn[]; droppedRounds: number } {
+  const assistants = turns.map((t, i) => (t.role === 'assistant' ? i : -1)).filter((i) => i >= 0);
+  if (!assistants.length) return { turns: turns.slice(-1), droppedRounds: 0 };
+  const rounds: Turn[][] = assistants.map((index, i) => {
+    const start = i === 0 ? 0 : Math.max(0, index - 1);
+    const end = i + 1 < assistants.length ? assistants[i + 1] - 1 : turns.length - 1;
+    return turns.slice(start, end + 1);
+  });
+  const build = (count: number) => rounds.slice(-count).flatMap((round, i) => (i === 0 ? round : round.slice(1)));
+  let count = Math.max(1, Math.min(Math.floor(maxRounds), rounds.length));
+  let candidate = build(count);
+  while (count > 1 && JSON.stringify(candidate).length > maxChars) {
+    count--;
+    candidate = build(count);
+  }
+  return { turns: candidate, droppedRounds: rounds.length - count };
+}
+
+function sanitizeReplayRaw(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeReplayRaw);
+  if (!value || typeof value !== 'object') return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    out[key] = key === 'plan' && typeof child === 'string' ? child.trim().slice(0, MAX_PLAN_CHARS) : sanitizeReplayRaw(child);
+  }
+  return out;
+}
+
 export class Contestant {
   readonly info: ContestantInfo;
   status: ContestantStatus = 'queued';
@@ -117,6 +180,7 @@ export class Contestant {
   private state: CubeState;
   private abort = new AbortController();
   private paused = false;
+  private pausedFromQueued = false;
   private resumeWaiters: (() => void)[] = [];
   private activeSince: number | null = null;
 
@@ -197,7 +261,8 @@ export class Contestant {
   }
 
   pause() {
-    if (this.status !== 'running') return false;
+    if (this.status !== 'running' && this.status !== 'queued') return false;
+    this.pausedFromQueued = this.status === 'queued';
     this.paused = true;
     this.setStatus('paused');
     return true;
@@ -206,7 +271,10 @@ export class Contestant {
   resume() {
     if (this.status !== 'paused') return false;
     this.paused = false;
-    this.setStatus('running');
+    if (this.pausedFromQueued) {
+      this.pausedFromQueued = false;
+      this.setStatus('queued');
+    } else this.setStatus('running');
     this.resumeWaiters.splice(0).forEach((fn) => fn());
     return true;
   }
@@ -231,6 +299,36 @@ export class Contestant {
     if (this.abort.signal.aborted) throw new StopSignal();
   }
 
+  private async acquireSlot(slot: Semaphore): Promise<boolean> {
+    for (;;) {
+      const ok = await slot.acquire(this.abort.signal);
+      if (!ok) return false;
+      if (!this.paused) return true;
+      slot.release();
+      await this.checkpoint();
+    }
+  }
+
+  private async acquireCredential(slot: Semaphore): Promise<boolean> {
+    for (;;) {
+      this.clockStop();
+      const ok = await slot.acquire(this.abort.signal);
+      this.clockStart();
+      if (!ok) return false;
+      if (this.paused) {
+        slot.release();
+        await this.checkpoint();
+        continue;
+      }
+      await this.checkpoint();
+      return true;
+    }
+  }
+
+  private queueExpired() {
+    return Date.now() - this.run.startedAt >= this.run.limits.maxDurationSec * 1000;
+  }
+
   private addUsage(u: { input: number | null; output: number | null; reasoning: number | null; cost: number | null } | null) {
     const s = this.stats;
     if (!u || u.input === null || u.output === null) s.usageMissingCalls++;
@@ -243,7 +341,7 @@ export class Contestant {
   }
 
   /** 执行一次 rotate_cube 调用，返回给模型的完整结构化工具结果 */
-  private async executeTool(call: ToolCall): Promise<{ content: string; moves: string[]; ok: boolean; error?: string }> {
+  private async executeTool(call: ToolCall): Promise<{ content: string; moves: string[]; ok: boolean; error?: string; plan?: string | null; planProvided: boolean }> {
     const stateResult = () => {
       const s = describeState(this.state);
       return {
@@ -252,7 +350,7 @@ export class Contestant {
         state: { encoding: s.encoding, size: s.size, net: s.net, faces: s.faces, state_hash: s.hash, move_count: this.stats.moves },
       };
     };
-    const reject = (code: string, message: string, retryable = true) => {
+    const reject = (code: string, message: string, retryable = true, planProvided = false) => {
       this.stats.invalidToolCalls++;
       const result = {
         ok: false,
@@ -262,19 +360,24 @@ export class Contestant {
         error: { code, message, retryable },
         ...stateResult(),
       };
-      return { content: JSON.stringify(result), moves: [], ok: false, error: message };
+      return { content: JSON.stringify(result), moves: [], ok: false, error: message, plan: null, planProvided };
     };
     if (call.name !== 'rotate_cube') return reject('UNKNOWN_TOOL', `未知工具 ${call.name}，只能调用 rotate_cube`);
     if (!call.args) return reject('INVALID_ARGUMENTS', call.argsError ?? '工具参数无法解析');
-    const raw = (call.args as { moves?: unknown }).moves;
+    const args = call.args as { moves?: unknown; plan?: unknown };
+    const rawPlan = args.plan;
+    const planProvided = rawPlan !== undefined;
+    if (planProvided && typeof rawPlan !== 'string') return reject('INVALID_PLAN', 'plan 必须是字符串', true, true);
+    const plan = planProvided ? rawPlan.trim().slice(0, MAX_PLAN_CHARS) : undefined;
+    const raw = args.moves;
     const tokens = Array.isArray(raw) ? raw.map(String) : typeof raw === 'string' ? raw.split(/[\s,]+/).filter(Boolean) : null;
-    if (!tokens || !tokens.length) return reject('EMPTY_MOVES', 'moves 必须是非空数组，例如 ["R", "U\'"]');
+    if (!tokens || !tokens.length) return reject('EMPTY_MOVES', 'moves 必须是非空数组，例如 ["R", "U\'"]', true, planProvided);
     if (tokens.length > this.run.limits.maxMovesPerCall) {
-      return reject('TOO_MANY_MOVES', `单次最多 ${this.run.limits.maxMovesPerCall} 步，本次 ${tokens.length} 步，已拒绝`);
+      return reject('TOO_MANY_MOVES', `单次最多 ${this.run.limits.maxMovesPerCall} 步，本次 ${tokens.length} 步，已拒绝`, true, planProvided);
     }
     const moves = tokens.map((t) => parseMove(t));
     const bad = tokens.filter((_, i) => !moves[i]);
-    if (bad.length) return reject('INVALID_MOVE', `非法记号：${bad.join(' ')}，整次调用未执行`);
+    if (bad.length) return reject('INVALID_MOVE', `非法记号：${bad.join(' ')}，整次调用未执行`, true, planProvided);
 
     const executed: string[] = [];
     for (const m of moves as Move[]) {
@@ -306,6 +409,8 @@ export class Contestant {
       }),
       moves: executed,
       ok: true,
+      plan,
+      planProvided,
     };
   }
 
@@ -315,17 +420,49 @@ export class Contestant {
   }
 
   async start() {
-    const runAcquired = await this.run.slots.acquire(this.abort.signal);
+    try {
+      await this.checkpoint();
+    } catch (e) {
+      if (e instanceof StopSignal || this.abort.signal.aborted) {
+        this.setStatus('stopped', this.failReason ?? '排队时被停止');
+        this.config = undefined;
+        this.apiKey = undefined;
+        return;
+      }
+      throw e;
+    }
+    if (this.queueExpired()) {
+      this.setStatus('failed', `排队等待超过最大运行时间（${this.run.limits.maxDurationSec} 秒）`);
+      this.config = undefined;
+      this.apiKey = undefined;
+      return;
+    }
+    const runAcquired = await this.acquireSlot(this.run.slots);
     if (!runAcquired) {
       this.setStatus('stopped', this.failReason ?? '排队时被停止');
       this.config = undefined;
       this.apiKey = undefined;
       return;
     }
-    const globalAcquired = await globalSessions.acquire(this.abort.signal);
+    if (this.queueExpired()) {
+      this.run.slots.release();
+      this.setStatus('failed', `排队等待超过最大运行时间（${this.run.limits.maxDurationSec} 秒）`);
+      this.config = undefined;
+      this.apiKey = undefined;
+      return;
+    }
+    const globalAcquired = await this.acquireSlot(globalSessions);
     if (!globalAcquired) {
       this.run.slots.release();
       this.setStatus('stopped', this.failReason ?? '排队时被停止');
+      this.config = undefined;
+      this.apiKey = undefined;
+      return;
+    }
+    if (this.queueExpired()) {
+      this.run.slots.release();
+      globalSessions.release();
+      this.setStatus('failed', `排队等待超过最大运行时间（${this.run.limits.maxDurationSec} 秒）`);
       this.config = undefined;
       this.apiKey = undefined;
       return;
@@ -368,7 +505,7 @@ export class Contestant {
       memory: TurnMemory,
     ) => {
       const nextStateTurn = this.stateTurn(memory);
-      const assistantTurn: Turn = { role: 'assistant', text: result.text, toolCalls: result.toolCalls, raw: result.raw };
+      const assistantTurn: Turn = { role: 'assistant', text: result.text, toolCalls: result.toolCalls, raw: sanitizeReplayRaw(result.raw) };
       turns.push(assistantTurn);
       if (toolResults.length) turns.push({ role: 'tool', results: toolResults });
       turns.push(nextStateTurn);
@@ -380,6 +517,7 @@ export class Contestant {
     let noProgressStreak = 0;
     let invalidToolStreak = 0;
     let lastStateHash = describeState(this.state).hash;
+    let historyCompactionLogged = false;
     const limiter = credentialLimiter(hostOf(endpoint), apiKey, config.maxConcurrentRequests);
     try {
       for (;;) {
@@ -396,9 +534,7 @@ export class Contestant {
           if (requestRemainingMs <= 0) return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
           // 等待同一密钥的并发名额时暂停计时：这是供应商的容量限制，不算模型用时
           if (limiter) {
-            this.clockStop();
-            const ok = await limiter.acquire(this.abort.signal);
-            this.clockStart();
+            const ok = await this.acquireCredential(limiter);
             if (!ok) throw new StopSignal();
           }
           this.stats.apiCalls++;
@@ -407,12 +543,21 @@ export class Contestant {
           const started = Date.now();
           const toolChoice = forceTool && canForceTool ? 'required' : 'auto';
           try {
+            const compacted = compactTurns(turns, limits.maxHistoryRounds, limits.maxContextChars);
+            if (compacted.droppedRounds > 0) {
+              turns = compacted.turns;
+              if (!historyCompactionLogged) {
+                this.log('info', `已压缩 ${compacted.droppedRounds} 个较早协议回合，保留最近 ${limits.maxHistoryRounds} 轮和最新 canonical state`);
+                historyCompactionLogged = true;
+              }
+            }
             result = await adapter.call({
               config, model: this.model, reasoningEffort: this.effort, maxOutputTokens: this.maxOutputTokens,
               endpoint, apiKey, system, tools, turns,
               toolChoice, signal: this.abort.signal,
               timeoutMs: Math.min(requestRemainingMs, limits.requestTimeoutSec * 1000),
             });
+            if (result.forcedToolSupported === false) canForceTool = false;
             this.stats.lastLatencyMs = Date.now() - started;
             this.stats.apiLatencyMs += this.stats.lastLatencyMs;
             break;
@@ -455,7 +600,7 @@ export class Contestant {
               const delay = Math.round(err.retryAfterMs ?? backoff);
               this.log('warn', `${err.message}，${(delay / 1000).toFixed(1)} 秒后重试（第 ${attempt}/${maxAttempts} 次）`);
               const waitMs = Math.min(delay, Math.max(0, limits.maxDurationSec * 1000 - this.elapsed()));
-              await new Promise((r) => setTimeout(r, waitMs));
+              await abortableDelay(waitMs, this.abort.signal);
               await this.checkpoint();
               continue;
             }
@@ -491,6 +636,7 @@ export class Contestant {
         const summaries: { moves: string[]; ok: boolean; error?: string }[] = [];
         const toolResults: { callId: string; name: string; content: string }[] = [];
         let newPlan: string | undefined;
+        let planSeen = false;
         for (const call of result.toolCalls) {
           this.stats.toolCalls++;
           // 必须回复每一个工具调用；复原后或达到上限时，剩余调用不再执行
@@ -509,20 +655,23 @@ export class Contestant {
                     state: { encoding: s.encoding, size: s.size, net: s.net, faces: s.faces, state_hash: s.hash, move_count: this.stats.moves },
                     error: { code: 'ALREADY_SOLVED', message: blocked, retryable: false },
                   }),
-                  moves: [], ok: false, error: blocked,
+                  moves: [], ok: false, error: blocked, plan: null, planProvided: false,
                 };
               })()
             : await this.executeTool(call);
           summaries.push({ moves: r.moves, ok: r.ok, error: r.error });
           toolResults.push({ callId: call.id, name: call.name, content: r.content });
-          const p = (call.args as { plan?: unknown } | null)?.plan;
-          if (typeof p === 'string' && p.trim()) newPlan = p.trim().slice(0, MAX_PLAN_CHARS);
+          if (r.planProvided) {
+            planSeen = true;
+            newPlan = r.plan ?? undefined;
+          }
         }
         this.recordCall(result, summaries, { plan: newPlan });
         this.emitStats();
         if (isSolved(this.state)) return this.setStatus('solved');
 
-        if (newPlan) plan = { n, text: newPlan };
+        if (planSeen) plan = newPlan ? { n, text: newPlan } : null;
+        else plan = null;
         const rejected = summaries.filter((s) => !s.ok).map((s) => s.error ?? '未知错误');
         invalidToolStreak = summaries.length > 0 && summaries.every((s) => !s.ok) ? invalidToolStreak + 1 : 0;
         if (invalidToolStreak >= limits.maxNoProgressCalls) return this.setStatus('failed', `连续 ${limits.maxNoProgressCalls} 次工具调用无效`);
@@ -567,7 +716,7 @@ export class Contestant {
   }
 }
 
-type Listener = (e: RunEvent) => void;
+type Listener = (e: RunEventEnvelope) => void;
 
 export class Run {
   readonly id = randomUUID();
@@ -577,9 +726,11 @@ export class Run {
   readonly initialState: CubeState;
   readonly contestants: Contestant[];
   readonly slots: Semaphore;
-  readonly events: RunEvent[] = [];
+  readonly events: RunEventEnvelope[] = [];
   status: 'running' | 'finished' = 'running';
   finishedAt: string | null = null;
+  private doneEmitted = false;
+  private eventSeq = 0;
   private listeners = new Set<Listener>();
 
   constructor(
@@ -593,7 +744,7 @@ export class Run {
     this.initialState = Object.freeze(this.scramble.reduce(applyMove, solvedState(cubeSize))) as CubeState;
     this.slots = new Semaphore(Math.max(1, Math.floor(limits.concurrency)));
     this.contestants = entries.map((e) => new Contestant(this, e));
-    this.emit({ type: 'init', run: this.summary() });
+    this.emit({ type: 'init', run: this.publicSummary() });
   }
 
   summary(): RunSummary {
@@ -612,18 +763,46 @@ export class Run {
     };
   }
 
+  publicSummary(): PublicRunSummary {
+    const { scramble: _scramble, initialState: _initialState, ...publicSummary } = this.summary();
+    return publicSummary;
+  }
+
   record(): RunRecord {
     return { ...this.summary(), traces: Object.fromEntries(this.contestants.map((c) => [c.info.id, c.trace])) };
   }
 
+  publicRecord(): PublicRunRecord {
+    const traces = Object.fromEntries(this.contestants.map((c) => [c.info.id, c.trace.map((item) => {
+      if (item.type !== 'call' || !('reasoning' in item)) return item;
+      const { reasoning: _reasoning, ...publicItem } = item;
+      return publicItem;
+    })]));
+    return { ...this.publicSummary(), traces };
+  }
+
+  reportRecord(): RunRecord {
+    const traces = Object.fromEntries(this.contestants.map((c) => [c.info.id, c.trace.map((item) => {
+      if (item.type !== 'call' || !('reasoning' in item)) return item;
+      const { reasoning: _reasoning, ...reportItem } = item;
+      return reportItem;
+    })]));
+    return { ...this.summary(), traces };
+  }
+
   emit(e: RunEvent) {
-    this.events.push(e);
-    for (const fn of this.listeners) fn(e);
+    const envelope = { seq: ++this.eventSeq, event: e } satisfies RunEventEnvelope;
+    this.events.push(envelope);
+    for (const fn of this.listeners) fn(envelope);
   }
 
   subscribe(fn: Listener) {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
+  }
+
+  get done() {
+    return this.doneEmitted;
   }
 
   contestant(cid: string) {
@@ -647,8 +826,9 @@ export class Run {
     await Promise.allSettled(this.contestants.map((c) => c.start()));
     this.status = 'finished';
     this.finishedAt = new Date().toISOString();
-    await saveRun(this.record()).catch((e) => console.error('保存评测记录失败：', (e as Error).message));
-    this.emit({ type: 'done', run: this.summary() });
+    await saveRun(this.reportRecord()).catch((e) => console.error('保存评测记录失败：', (e as Error).message));
+    this.emit({ type: 'done', run: this.publicSummary() });
+    this.doneEmitted = true;
     this.listeners.clear();
   }
 }

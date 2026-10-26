@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import {
-  CUBE_SIZE_INFO, DEFAULT_LIMITS, DIFFICULTIES, MAX_SCRAMBLE_LENGTH, PROTOCOLS, REASONING_EFFORTS, TERMINAL_STATUSES, type RunEntry, type RunLimits,
+  CUBE_SIZE_INFO, DEFAULT_LIMITS, DIFFICULTIES, MAX_SCRAMBLE_LENGTH, PROTOCOLS, REASONING_EFFORTS, TERMINAL_STATUSES, type RunEntry, type RunEventEnvelope, type RunLimits,
 } from '../shared/types.ts';
 import { STATE_ENCODING } from './arena/prompt.ts';
 import { Run, runs, type ContestantEntry } from './arena/run.ts';
@@ -40,6 +40,15 @@ const wrap =
   (fn: (req: Request, res: Response) => Promise<unknown>) =>
   (req: Request, res: Response, next: NextFunction) =>
     fn(req, res).catch(next);
+
+function stripReasoning<T extends { traces: Record<string, any[]> }>(record: T): T {
+  const traces = Object.fromEntries(Object.entries(record.traces).map(([cid, items]) => [cid, items.map((item) => {
+    if (item?.type !== 'call' || !('reasoning' in item)) return item;
+    const { reasoning: _reasoning, ...publicItem } = item;
+    return publicItem;
+  })]));
+  return { ...record, traces };
+}
 
 // ---------------- 元数据 ----------------
 
@@ -80,9 +89,11 @@ const clamp = (v: unknown, min: number, max: number, fallback: number) => {
 };
 
 app.post('/api/runs', wrap(async (req, res) => {
-  const { entries, difficulty, scrambleLength, cubeSize = 3, limits = {} } = (req.body ?? {}) as {
-    entries?: RunEntry[]; providers?: { config: unknown; apiKey?: unknown }[]; difficulty?: string; scrambleLength?: number; cubeSize?: number; limits?: Partial<RunLimits>;
+  const body = (req.body ?? {}) as {
+    entries?: RunEntry[]; providers?: { config: unknown; apiKey?: unknown }[]; difficulty?: string; scrambleLength?: number; cubeSize?: number; limits?: Partial<RunLimits> | null;
   };
+  const { entries, difficulty, scrambleLength, cubeSize = 3 } = body;
+  const limits = body.limits && typeof body.limits === 'object' && !Array.isArray(body.limits) ? body.limits : {};
   if (!CUBE_SIZE_INFO.some((c) => c.n === cubeSize)) throw new DraftError('不支持的魔方阶数');
   // 打乱步数：直接给出步数，或沿用预设 id
   const steps = scrambleLength ?? DIFFICULTIES.find((d) => d.id === difficulty)?.scrambleLength;
@@ -110,7 +121,7 @@ app.post('/api/runs', wrap(async (req, res) => {
     const reasoningEffort = REASONING_EFFORTS.some((r) => r.id === e.reasoningEffort) ? e.reasoningEffort : 'default';
     const maxOut = e.maxOutputTokens == null || String(e.maxOutputTokens) === '' ? null : Math.round(Number(e.maxOutputTokens));
     if (maxOut !== null && (!Number.isFinite(maxOut) || maxOut < 64 || maxOut > 200_000)) throw new DraftError('最大输出 Token 应为 64～200000');
-    const key = `${config.id}\0${model}\0${reasoningEffort}`;
+    const key = `${config.id}\0${model}\0${reasoningEffort}\0${maxOut ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
     contestants.push({ config, apiKey: suppliedProvider?.apiKey, model, reasoningEffort, maxOutputTokens: maxOut });
@@ -121,6 +132,8 @@ app.post('/api/runs', wrap(async (req, res) => {
     maxMovesPerCall: clamp(limits.maxMovesPerCall, 1, 50, DEFAULT_LIMITS.maxMovesPerCall),
     maxNoToolCalls: clamp(limits.maxNoToolCalls, 1, 20, DEFAULT_LIMITS.maxNoToolCalls),
     maxNoProgressCalls: clamp(limits.maxNoProgressCalls, 1, 20, DEFAULT_LIMITS.maxNoProgressCalls),
+    maxHistoryRounds: clamp(limits.maxHistoryRounds, 1, 10, DEFAULT_LIMITS.maxHistoryRounds),
+    maxContextChars: clamp(limits.maxContextChars, 16_000, 500_000, DEFAULT_LIMITS.maxContextChars),
     concurrency: clamp(limits.concurrency, 1, 64, DEFAULT_LIMITS.concurrency),
     requestTimeoutSec: clamp(limits.requestTimeoutSec, 10, 600, DEFAULT_LIMITS.requestTimeoutSec),
   };
@@ -131,28 +144,30 @@ app.post('/api/runs', wrap(async (req, res) => {
 }));
 
 app.get('/api/runs', wrap(async (_req, res) => {
-  const live = [...runs.values()].filter((r) => r.status === 'running').map((r) => r.summary());
+  const live = [...runs.values()].filter((r) => !r.done).map((r) => r.publicSummary());
   const saved = (await listRuns()).filter((s) => !live.some((l) => l.id === s.id));
   res.json([...live, ...saved]);
 }));
 
 app.get('/api/runs/:id', wrap(async (req, res) => {
   const live = runs.get(String(req.params.id));
-  const record = live ? live.record() : await loadRun(String(req.params.id));
+  const record = live ? (live.done ? live.reportRecord() : live.publicRecord()) : await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
-  res.json(record);
+  res.json(stripReasoning(record));
 }));
 
 /** 导出评测记录（不含任何密钥） */
 app.get('/api/runs/:id/export', wrap(async (req, res) => {
   const live = runs.get(String(req.params.id));
-  const record = live ? live.record() : await loadRun(String(req.params.id));
+  if (live && !live.done) return res.status(409).json({ error: '评测尚未结束，暂不可导出' });
+  const record = live ? live.reportRecord() : await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
+  const safeRecord = stripReasoning(record);
   res.setHeader('Content-Disposition', `attachment; filename="cube-run-${record.id.slice(0, 8)}.json"`);
-  res.json({ format: 'ai-cube-arena/run@1', stateEncoding: STATE_ENCODING, ...record });
+  res.json({ format: 'ai-cube-arena/run@1', stateEncoding: STATE_ENCODING, ...safeRecord });
 }));
 
-/** SSE：先回放已有事件，再推送实时事件 */
+/** SSE：用单调序号订阅并回放，支持 Last-Event-ID 断线重连。 */
 app.get('/api/runs/:id/stream', (req, res) => {
   const run = runs.get(String(req.params.id));
   if (!run) return res.status(404).end();
@@ -162,15 +177,39 @@ app.get('/api/runs/:id/stream', (req, res) => {
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
-  const send = (e: unknown) => res.write(`data: ${JSON.stringify(e)}\n\n`);
+  const after = Number(req.get('Last-Event-ID') ?? 0);
+  let closed = false;
+  let unsubscribe = () => {};
+  const send = (envelope: RunEventEnvelope) => {
+    if (closed || envelope.seq <= after || res.destroyed || res.writableEnded) return;
+    try {
+      const event = envelope.event.type === 'call' && 'reasoning' in envelope.event.item
+        ? { ...envelope, event: { ...envelope.event, item: (({ reasoning: _reasoning, ...item }) => item)(envelope.event.item) } }
+        : envelope;
+      res.write(`id: ${envelope.seq}\ndata: ${JSON.stringify(event)}\n\n`);
+      if (envelope.event.type === 'done') {
+        closed = true;
+        unsubscribe();
+        res.end();
+      }
+    } catch {
+      closed = true;
+      unsubscribe();
+      res.end();
+    }
+  };
+  unsubscribe = run.subscribe(send);
   run.events.forEach(send);
-  if (run.status === 'finished') return res.end();
-  const unsubscribe = run.subscribe((e) => {
-    send(e);
-    if (e.type === 'done') res.end();
-  });
-  const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
+  if (run.done && !closed) {
+    closed = true;
+    unsubscribe();
+    res.end();
+  }
+  const ping = setInterval(() => {
+    if (!closed && !res.destroyed && !res.writableEnded) res.write(': ping\n\n');
+  }, 15_000);
   req.on('close', () => {
+    closed = true;
     clearInterval(ping);
     unsubscribe();
   });

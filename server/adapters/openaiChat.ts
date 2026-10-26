@@ -58,19 +58,22 @@ export const openaiChatAdapter: ProtocolAdapter = {
     const choice = json?.choices?.[0];
     if (!choice?.message) throw new ProviderError('parse', '响应中缺少 choices[0].message');
     const message = choice.message;
-    const toolCalls: ToolCall[] = (Array.isArray(message.tool_calls) ? message.tool_calls : [])
+    const normalizedCalls = (Array.isArray(message.tool_calls) ? message.tool_calls : [])
       .filter((c: any) => c?.function?.name)
       .map((c: any, i: number) => ({
+        ...c,
         id: String(c.id || `call_${Date.now()}_${i}`),
-        name: String(c.function.name),
-        ...parseArgs(c.function.arguments),
+        type: c.type ?? 'function',
       }));
-    // 缺少 id 的工具调用补齐，保证回放时 tool_call_id 能对应
+    const toolCalls: ToolCall[] = normalizedCalls.map((c: any) => ({
+      id: c.id,
+      name: String(c.function.name),
+      ...parseArgs(c.function.arguments),
+    }));
+    // 缺少 id 的工具调用补齐；没有函数名的 malformed call 不回放，避免下一轮缺少对应 tool result。
     const raw = {
       ...message,
-      tool_calls: Array.isArray(message.tool_calls)
-        ? message.tool_calls.map((c: any, i: number) => ({ ...c, id: toolCalls[i]?.id ?? c.id, type: c.type ?? 'function' }))
-        : undefined,
+      tool_calls: normalizedCalls.length ? normalizedCalls : undefined,
     };
     // 思考字段：DeepSeek / Kimi / Qwen 等用 reasoning_content，OpenRouter / Ollama 等用 reasoning；也可能以 <think> 写在正文
     const own = [message.reasoning_content, message.reasoning].find((v) => typeof v === 'string' && v.trim()) ?? '';

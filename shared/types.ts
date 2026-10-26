@@ -173,6 +173,10 @@ export interface RunLimits {
   maxNoToolCalls: number;
   /** 连续调用后 canonical state 未变化时允许的最大轮数 */
   maxNoProgressCalls: number;
+  /** 保留给供应商的最近完整协议回合数；更早回合由 canonical state 摘要替代 */
+  maxHistoryRounds: number;
+  /** 发送给供应商的近似上下文字符预算 */
+  maxContextChars: number;
   /** 同时运行的模型数 */
   concurrency: number;
   /** 单次 API 请求超时（秒） */
@@ -185,6 +189,8 @@ export const DEFAULT_LIMITS: RunLimits = {
   maxMovesPerCall: 10,
   maxNoToolCalls: 3,
   maxNoProgressCalls: 3,
+  maxHistoryRounds: 3,
+  maxContextChars: 120_000,
   concurrency: 4,
   requestTimeoutSec: 120,
 };
@@ -287,11 +293,23 @@ export interface RunRecord extends RunSummary {
   traces: Record<string, TraceItem[]>;
 }
 
+/** 运行中的公开摘要：不包含可直接泄露题目的 scramble 和初始面状态。 */
+export type PublicRunSummary = Omit<RunSummary, 'scramble' | 'initialState'>;
+
+export interface PublicRunRecord extends PublicRunSummary {
+  traces: Record<string, TraceItem[]>;
+}
+
 export type RunEvent =
-  | { type: 'init'; run: RunSummary }
+  | { type: 'init'; run: PublicRunSummary }
   | { type: 'status'; cid: string; status: ContestantStatus; reason: string | null; t: number }
   | { type: 'move'; cid: string; move: string; index: number; t: number }
   | { type: 'call'; cid: string; item: Extract<TraceItem, { type: 'call' }> }
   | { type: 'stats'; cid: string; stats: ContestantStats }
   | { type: 'log'; cid: string; level: 'info' | 'warn' | 'error'; text: string; t: number }
-  | { type: 'done'; run: RunSummary };
+  | { type: 'done'; run: PublicRunSummary };
+
+export interface RunEventEnvelope {
+  seq: number;
+  event: RunEvent;
+}

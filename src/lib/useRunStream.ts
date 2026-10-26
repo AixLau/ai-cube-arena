@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
-import type { ContestantState, RunEvent, RunRecord, RunSummary, TraceItem } from '../../shared/types.ts';
+import type { ContestantState, PublicRunSummary, RunEvent, RunEventEnvelope, RunRecord, RunSummary, TraceItem } from '../../shared/types.ts';
 import { api } from './api.ts';
 
 export interface LiveContestant {
@@ -14,7 +14,7 @@ export interface LiveContestant {
 }
 
 export interface RunView {
-  run: RunSummary | null;
+  run: RunSummary | PublicRunSummary | null;
   order: string[];
   cs: Record<string, LiveContestant>;
   finished: boolean;
@@ -132,7 +132,14 @@ export function useRunStream(runId: string | null): RunView {
     es.onopen = () => dispatch({ type: 'connection', state: 'open' });
     es.onmessage = (msg) => {
       let e: RunEvent;
-      try { e = JSON.parse(msg.data) as RunEvent; } catch { return; }
+      try {
+        const payload = JSON.parse(msg.data) as RunEventEnvelope | RunEvent;
+        e = 'event' in payload ? payload.event : payload;
+        if ('event' in payload && typeof payload.seq === 'number') {
+          if (seen.has(`seq:${payload.seq}`)) return;
+          seen.add(`seq:${payload.seq}`);
+        }
+      } catch { return; }
       if (seen.has(eventKey(e))) return;
       seen.add(eventKey(e));
       if (e.type === 'done') {

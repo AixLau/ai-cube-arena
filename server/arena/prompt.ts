@@ -75,6 +75,8 @@ export function systemPrompt(limits: RunLimits, n: number = 3): string {
 最大运行时间：${limits.maxDurationSec} 秒
 连续无工具阈值：${limits.maxNoToolCalls}
 连续无进展阈值：${limits.maxNoProgressCalls}
+历史保留回合数：${limits.maxHistoryRounds}
+近似上下文字符预算：${limits.maxContextChars}
 </runtime_limits>
 
 <state_contract>

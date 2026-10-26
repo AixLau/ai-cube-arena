@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { CUBE_SIZE_INFO, scrambleLengthOf, scrambleLevelName, TERMINAL_STATUSES } from '../../../shared/types.ts';
+import { CUBE_SIZE_INFO, scrambleLevelName, TERMINAL_STATUSES } from '../../../shared/types.ts';
 import { api } from '../../lib/api.ts';
 import { formatDate } from '../../lib/format.ts';
 import type { RunView } from '../../lib/useRunStream.ts';
@@ -58,8 +58,10 @@ export default function ArenaLive({ runId, view, onNew }: { runId: string; view:
   }
 
   const n = run.cubeSize ?? 3;
+  const scramble = 'scramble' in run ? run.scramble : null;
+  const initialState = 'initialState' in run ? run.initialState : null;
   const sizeInfo = CUBE_SIZE_INFO.find((c) => c.n === n);
-  const steps = scrambleLengthOf(run);
+  const steps = run.scrambleLength ?? (scramble ? scramble.split(' ').filter(Boolean).length : 0);
   const act = (fn: () => Promise<unknown>) => fn().catch((e) => setError((e as Error).message));
   const focusedC = focused ? view.cs[focused] : null;
   const stopAll = () => {
@@ -69,8 +71,12 @@ export default function ArenaLive({ runId, view, onNew }: { runId: string; view:
   const lastUpdated = view.lastUpdatedAt ? `${Math.max(0, Math.floor((Date.now() - view.lastUpdatedAt) / 1000))} 秒前` : '尚未收到更新';
 
   const copyState = async () => {
+    if (!scramble || !initialState) {
+      setError('评测结束后才能复制完整初始状态');
+      return;
+    }
     try {
-      await navigator.clipboard.writeText(`打乱：${run.scramble}\n初始状态（URFDLB）：${run.initialState}`);
+      await navigator.clipboard.writeText(`打乱：${scramble}\n初始状态（URFDLB）：${initialState}`);
       setCopied(true);
       setTimeout(() => setCopied(false), 1600);
     } catch {
@@ -79,7 +85,7 @@ export default function ArenaLive({ runId, view, onNew }: { runId: string; view:
   };
 
   const cardProps = (id: string) => ({
-    scramble: run.scramble,
+    scramble,
     cubeSize: n,
     tempo: speed * 1.5,
     showHiddenFaces,
@@ -185,8 +191,7 @@ export default function ArenaLive({ runId, view, onNew }: { runId: string; view:
               <button className="btn soft sm" onClick={copyState}>{copied ? '已复制' : '⧉ 复制状态'}</button>
             </header>
             <div className="init-state">
-              <div className="init-cube"><CubeViewer setupAlg={run.scramble} size={n} /></div>
-              <div className="init-alg mono">{run.scramble}</div>
+              {scramble ? <><div className="init-cube"><CubeViewer setupAlg={scramble} size={n} /></div><div className="init-alg mono">{scramble}</div></> : <p className="hint-text">评测进行中，初始打乱在服务端受保护；结束后可在报告中查看。</p>}
             </div>
           </section>
         </aside>

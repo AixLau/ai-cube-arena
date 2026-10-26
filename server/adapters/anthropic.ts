@@ -75,6 +75,7 @@ export const anthropicAdapter: ProtocolAdapter = {
       raw: json.content,
       finishReason: json.stop_reason ?? null,
       truncated: json.stop_reason === 'max_tokens',
+      forcedToolSupported: !body.thinking,
       // Anthropic 的 output_tokens 已包含思考 Token，且不单独给出，推理 Token 记为未知
       usage: u ? { input, output: usageNum(u.output_tokens), reasoning: null, cost: reportedCost(u) } : null,
     };
