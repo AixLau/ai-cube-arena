@@ -9,7 +9,7 @@ import {
 } from '../shared/types.ts';
 import { STATE_ENCODING } from './arena/prompt.ts';
 import { MAX_ACTIVE_SESSIONS, Run, runs, type ContestantEntry } from './arena/run.ts';
-import { listRuns, loadRun } from './arena/store.ts';
+import { listRuns, loadRun, migrateLegacyRuns } from './arena/store.ts';
 import {
   DraftError, modelsOf, normalizeProvider, refreshProvider, validateApiKey,
 } from './providers/store.ts';
@@ -62,6 +62,12 @@ function publicRecordOf(record: RunRecord): PublicRunRecord {
   return publicRecord;
 }
 
+function clientRecordOf(record: RunRecord): Omit<RunRecord, 'ownerId'> {
+  const safe = stripReasoning(record);
+  const { ownerId: _ownerId, ...clientRecord } = safe;
+  return clientRecord;
+}
+
 const OWNER_COOKIE = 'cube_arena_owner';
 function requestOwner(req: Request): string | undefined {
   const raw = req.headers.cookie ?? '';
@@ -72,7 +78,8 @@ function ensureOwner(req: Request, res: Response): string {
   const existing = requestOwner(req);
   if (existing) return existing;
   const owner = randomUUID();
-  res.append('Set-Cookie', `${OWNER_COOKIE}=${owner}; Path=/; HttpOnly; SameSite=Strict${req.secure ? '; Secure' : ''}`);
+  const secure = req.secure || process.env.NODE_ENV === 'production';
+  res.append('Set-Cookie', `${OWNER_COOKIE}=${owner}; Path=/; HttpOnly; SameSite=Strict${secure ? '; Secure' : ''}`);
   return owner;
 }
 
@@ -175,6 +182,7 @@ app.post('/api/runs', wrap(async (req, res) => {
 
 app.get('/api/runs', wrap(async (_req, res) => {
   const owner = requestOwner(_req);
+  if (owner) await migrateLegacyRuns(owner);
   const live = [...runs.values()].filter((r) => !r.done && owns(r, owner)).map((r) => r.publicSummary());
   const saved = (await listRuns()).filter((s) => s.ownerId === owner && !live.some((l) => l.id === s.id)).map(publicSummaryOf);
   res.json([...live, ...saved]);
@@ -198,7 +206,7 @@ app.get('/api/runs/:id/report', wrap(async (req, res) => {
   const record = live ? live.reportRecord() : await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
   if (!live && record.ownerId !== requestOwner(req)) return res.status(404).json({ error: '记录不存在' });
-  res.json(stripReasoning(record));
+  res.json(clientRecordOf(record));
 }));
 
 /** 导出评测记录（不含任何密钥） */
@@ -209,7 +217,7 @@ app.get('/api/runs/:id/export', wrap(async (req, res) => {
   const record = live ? live.reportRecord() : await loadRun(String(req.params.id));
   if (!record) return res.status(404).json({ error: '记录不存在' });
   if (!live && record.ownerId !== requestOwner(req)) return res.status(404).json({ error: '记录不存在' });
-  const safeRecord = stripReasoning(record);
+  const safeRecord = clientRecordOf(record);
   res.setHeader('Content-Disposition', `attachment; filename="cube-run-${record.id.slice(0, 8)}.json"`);
   res.json({ format: 'ai-cube-arena/run@1', stateEncoding: STATE_ENCODING, ...safeRecord });
 }));

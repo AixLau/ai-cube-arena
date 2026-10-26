@@ -28,16 +28,42 @@ export async function listRuns(): Promise<RunSummary[]> {
   return index;
 }
 
-export async function saveRun(record: RunRecord) {
+/** 单用户升级兼容：首次带 owner cookie 访问时，将旧记录绑定到该浏览器会话。 */
+export async function migrateLegacyRuns(ownerId: string): Promise<void> {
+  let changed = false;
+  try {
+    for (const f of await readdir(RUN_DIR)) {
+      if (!f.endsWith('.json')) continue;
+      const file = path.join(RUN_DIR, f);
+      try {
+        const record = JSON.parse(await readFile(file, 'utf8')) as RunRecord;
+        if (record.ownerId) continue;
+        record.ownerId = ownerId;
+        await writeFile(file, JSON.stringify(record));
+        changed = true;
+      } catch { /* 跳过损坏文件 */ }
+    }
+  } catch { /* 目录不存在 */ }
+  if (changed) index = null;
+}
+
+export async function saveRun(record: RunRecord): Promise<boolean> {
   await mkdir(RUN_DIR, { recursive: true });
-  const serialized = JSON.stringify(record);
-  if (Buffer.byteLength(serialized, 'utf8') > MAX_REPORT_BYTES) throw new Error(`评测记录超过 ${MAX_REPORT_BYTES} 字节上限`);
+  let toSave = record;
+  let serialized = JSON.stringify(toSave);
+  let incomplete = false;
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_REPORT_BYTES) {
+    incomplete = true;
+    toSave = { ...record, reportIncomplete: true, traces: {} };
+    serialized = JSON.stringify(toSave);
+  }
   await writeFile(path.join(RUN_DIR, `${record.id}.json`), serialized);
   const list = await listRuns();
-  const { traces: _t, ...summary } = record;
+  const { traces: _t, ...summary } = toSave;
   const i = list.findIndex((r) => r.id === record.id);
   if (i >= 0) list[i] = summary;
   else list.unshift(summary);
+  return incomplete;
 }
 
 export async function loadRun(id: string): Promise<RunRecord | null> {

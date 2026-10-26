@@ -138,7 +138,7 @@ export function useRunStream(runId: string | null): RunView {
         const payload = JSON.parse(msg.data) as RunEventEnvelope | RunEvent;
         e = 'event' in payload ? payload.event : payload;
         hasSeq = 'event' in payload && typeof (payload as RunEventEnvelope).seq === 'number';
-        if (hasSeq) {
+        if (hasSeq && e.type !== 'reset') {
           const seq = (payload as RunEventEnvelope).seq;
           if (seen.has(`seq:${seq}`)) return;
           seen.add(`seq:${seq}`);

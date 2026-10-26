@@ -72,12 +72,13 @@ export const geminiAdapter: ProtocolAdapter = {
       secrets: [ctx.apiKey],
     });
     const cand = json?.candidates?.[0];
-    if (!cand) {
+    if (!cand || typeof cand !== 'object' || Array.isArray(cand)) {
       const reason = json?.promptFeedback?.blockReason;
       throw new ProviderError('parse', reason ? `请求被拦截：${reason}` : '响应中缺少 candidates（该地址可能不是 Gemini 协议）');
     }
-    if (cand.content?.parts != null && !Array.isArray(cand.content.parts)) throw new ProviderError('parse', 'Gemini candidates[0].content.parts 不是数组');
-    const parts: any[] = cand.content?.parts ?? [];
+    if (!cand.content || typeof cand.content !== 'object' || Array.isArray(cand.content)) throw new ProviderError('parse', 'Gemini candidates[0].content 不是对象');
+    if (!Array.isArray(cand.content.parts)) throw new ProviderError('parse', 'Gemini candidates[0].content.parts 不是数组');
+    const parts: any[] = cand.content.parts;
     const normalizedParts: any[] = [];
     const toolCalls: ToolCall[] = [];
     const allowedTools = new Set(ctx.tools.map((tool) => tool.name));

@@ -64,10 +64,14 @@ export const anthropicAdapter: ProtocolAdapter = {
         const id = normalizeToolCallId(b.id, `anthropic_call_${toolCalls.length}`);
         normalizedContent.push({ ...b, id, name, input: ok ? b.input : {} });
         toolCalls.push({ id, name, args: ok ? b.input : null, argsError: ok ? undefined : '工具参数不是 JSON 对象' });
-      } else if (b.type === 'text') { normalizedContent.push(b); text += b.text ?? ''; }
+      } else if (b.type === 'text') {
+        if (typeof b.text !== 'string') throw new ProviderError('parse', 'Anthropic text block.text 不是字符串');
+        normalizedContent.push(b); text += b.text;
+      }
       // redacted_thinking 只有密文，不展示
       else if (b.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.trim()) { normalizedContent.push(b); thoughts.push(b.thinking.trim()); }
       else if (b.type === 'redacted_thinking') normalizedContent.push(b);
+      else throw new ProviderError('parse', `Anthropic 不支持的 content block 类型：${String(b.type)}`);
     }
     const u = json.usage;
     const input = u

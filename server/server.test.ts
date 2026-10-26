@@ -435,6 +435,7 @@ test('HTTP 供应商接口：移除旧存储接口，环境变量不预置，每
       assert.equal((await fetch(`${origin}/api/runs/${id}/report`)).status, 404, '没有 owner cookie 不能读取私有报告');
       const privateReport = await (await getOwned(`${origin}/api/runs/${id}/report`)).json() as Record<string, unknown>;
       assert.equal(typeof privateReport.scramble, 'string');
+      assert.equal('ownerId' in privateReport, false);
       const exported = await (await getOwned(`${origin}/api/runs/${id}/export`)).json() as {
         contestants: { status: string }[];
       };
@@ -442,6 +443,7 @@ test('HTTP 供应商接口：移除旧存储接口，环境变量不预置，每
       assert.ok(!JSON.stringify(exported).includes(config.apiKey));
       assert.ok(!JSON.stringify(exported).includes('baseUrl'));
       assert.ok(!JSON.stringify(exported).includes('thinking…'), '导出默认不包含原始 reasoning');
+      assert.ok(!JSON.stringify(exported).includes('ownerId'), '导出不应包含 owner token');
     } finally {
       mock.delayMs = 0;
     }

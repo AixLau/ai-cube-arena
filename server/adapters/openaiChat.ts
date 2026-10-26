@@ -55,8 +55,9 @@ export const openaiChatAdapter: ProtocolAdapter = {
       const { max_tokens, ...rest } = body;
       ({ json } = await send({ ...rest, max_completion_tokens: max_tokens }));
     }
-    const choice = json?.choices?.[0];
-    if (!choice?.message) throw new ProviderError('parse', '响应中缺少 choices[0].message');
+    if (!Array.isArray(json?.choices)) throw new ProviderError('parse', '响应中缺少 choices 数组');
+    const choice = json.choices[0];
+    if (!choice || typeof choice !== 'object' || !choice.message || typeof choice.message !== 'object' || Array.isArray(choice.message)) throw new ProviderError('parse', '响应中缺少 choices[0].message 对象');
     const message = choice.message;
     const allowedTools = new Set(ctx.tools.map((tool) => tool.name));
     const normalizedCalls = (Array.isArray(message.tool_calls) ? message.tool_calls : [])

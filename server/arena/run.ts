@@ -949,7 +949,7 @@ export class Run {
     await Promise.allSettled(this.contestants.map((c) => c.start()));
     this.status = 'finished';
     this.finishedAt = new Date().toISOString();
-    await saveRun(this.reportRecord()).catch((e) => {
+    await saveRun(this.reportRecord()).then((incomplete) => { this.reportIncomplete ||= incomplete; }).catch((e) => {
       this.reportIncomplete = true;
       console.error('评测报告未完整保存：', (e as Error).message);
     });
