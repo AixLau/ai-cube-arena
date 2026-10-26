@@ -1,5 +1,5 @@
 import { authHeaders, postJson, ProviderError } from './http.ts';
-import { parseArgs, reportedCost, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
+import { contextTimeout, normalizeArguments, normalizeToolCallId, normalizeToolName, parseArgs, reportedCost, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
 
 /** OpenAI Responses API（input items / function_call / function_call_output） */
 function toInput(turns: Turn[]) {
@@ -31,10 +31,6 @@ function toInput(turns: Turn[]) {
     }
   }
   return items;
-}
-
-function normalizeFunctionCallId(item: Record<string, any>, index: number): string {
-  return String(item.call_id ?? item.id ?? `responses_call_${Date.now()}_${index}`);
 }
 
 const reasoningSummaryUnsupported = new Set<string>();
@@ -83,7 +79,7 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
 
     const send = () => postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), body, {
       signal: ctx.signal,
-      timeoutMs: ctx.timeoutMs,
+      timeoutMs: contextTimeout(ctx),
       secrets: [ctx.apiKey],
     });
     let json: any;
@@ -120,11 +116,17 @@ export const openaiResponsesAdapter: ProtocolAdapter = {
     const toolCalls: ToolCall[] = [];
     let text = '';
     const thoughts: string[] = [];
-    const rawOutput = (json.output as Record<string, any>[]).map((it, index) => {
-      if (it?.type !== 'function_call') return it;
-      const callId = normalizeFunctionCallId(it, index);
-      return { ...it, id: it.id ?? callId, call_id: callId };
-    });
+    const rawOutput: Record<string, any>[] = [];
+    for (const [index, it] of (json.output as Record<string, any>[]).entries()) {
+      if (it?.type !== 'function_call') {
+        rawOutput.push(it);
+        continue;
+      }
+      const name = normalizeToolName(it.name);
+      if (!name) continue;
+      const callId = normalizeToolCallId(it.call_id ?? it.id, `responses_call_${index}`);
+      rawOutput.push({ ...it, id: it.id ?? callId, call_id: callId, name, arguments: normalizeArguments(it.arguments) });
+    }
     for (const it of rawOutput) {
       if (it.type === 'function_call') {
         toolCalls.push({ id: String(it.call_id), name: String(it.name), ...parseArgs(it.arguments) });

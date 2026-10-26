@@ -7,7 +7,7 @@ import {
   CUBE_SIZE_INFO, DEFAULT_LIMITS, DIFFICULTIES, MAX_SCRAMBLE_LENGTH, PROTOCOLS, REASONING_EFFORTS, TERMINAL_STATUSES, type RunEntry, type RunEventEnvelope, type RunLimits,
 } from '../shared/types.ts';
 import { STATE_ENCODING } from './arena/prompt.ts';
-import { Run, runs, type ContestantEntry } from './arena/run.ts';
+import { MAX_ACTIVE_SESSIONS, Run, runs, type ContestantEntry } from './arena/run.ts';
 import { listRuns, loadRun } from './arena/store.ts';
 import {
   DraftError, modelsOf, normalizeProvider, refreshProvider, validateApiKey,
@@ -60,7 +60,7 @@ app.get('/api/meta', (_req, res) => {
     defaultLimits: DEFAULT_LIMITS,
     stateEncoding: STATE_ENCODING,
     reasoningEfforts: REASONING_EFFORTS,
-    maxActiveSessions: Number(process.env.MAX_ACTIVE_SESSIONS || 16),
+    maxActiveSessions: MAX_ACTIVE_SESSIONS,
   });
 });
 

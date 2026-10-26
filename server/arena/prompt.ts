@@ -50,8 +50,8 @@ const ORDER_NAME: Record<number, string> = { 2: '二阶', 3: '三阶', 4: '四�
 /** 不同阶数的朝向说明：奇数阶中心固定；偶数阶没有固定中心 */
 function orientationNote(n: number): string {
   if (n === 2) return '二阶魔方没有中心块，也不区分固定朝向：只要每个面颜色一致即视为复原，不要求某个颜色在某个面。';
-  if (n === 4) return '只允许外层转动，因此每个面中央的 2×2 中心区块永不移动，可作为该面的目标颜色参照。';
-  return '中心块永不移动，可作为该面的目标颜色参照。';
+  if (n === 4) return '当前只允许外层转动；中心块不会跨到其他面，但会随外层转动在本面内旋转，可用于判断目标颜色。';
+  return '当前只允许外层转动；中心块不会跨到其他面，但会随外层转动在本面内旋转，可用于判断目标颜色。';
 }
 
 export function systemPrompt(limits: RunLimits, n: number = 3): string {
@@ -91,11 +91,12 @@ export function systemPrompt(limits: RunLimits, n: number = 3): string {
 1. 所有实际旋转必须通过 rotate_cube 完成。
 2. moves 数量必须在 1 到 ${limits.maxMovesPerCall} 之间，且每个动作符合 schema。
 3. 整批拒绝视为零动作执行；修正输入或缩短批次后重新规划，不得原样重试。
-4. 不在普通文本中伪造已执行动作，不输出隐藏思维链或未经验证的长计划。
+4. 每次 assistant 响应只提交一个 rotate_cube 调用；不要并行提交多个依赖状态的调用。
+5. 不在普通文本中伪造已执行动作，不输出隐藏思维链或未经验证的长计划。
 </tool_policy>
 
 <planning_policy>
-先识别当前阶段和未完成部分，再规划一小段合法动作；优先保持已完成结构。确定性高时可提交较长但不超过上限的公式，不确定或刚发生错误时缩短批次。对大于 3×3 的魔方，分别处理中心、棱块配对和最后阶段。
+先识别当前阶段和未完成部分，再规划一小段合法动作；优先保持已完成结构。确定性高时可提交较长但不超过上限的公式，不确定或刚发生错误时缩短批次。当前工具只支持外层 R/L/U/D/F/B 及其变体，不支持内层、宽层或 M/E/S；4×4 和 5×5 不要规划无法由当前动作空间表达的 reduction 算法。
 </planning_policy>
 
 <loop>

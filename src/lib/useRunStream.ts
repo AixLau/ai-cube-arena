@@ -132,16 +132,21 @@ export function useRunStream(runId: string | null): RunView {
     es.onopen = () => dispatch({ type: 'connection', state: 'open' });
     es.onmessage = (msg) => {
       let e: RunEvent;
+      let hasSeq = false;
       try {
         const payload = JSON.parse(msg.data) as RunEventEnvelope | RunEvent;
         e = 'event' in payload ? payload.event : payload;
-        if ('event' in payload && typeof payload.seq === 'number') {
-          if (seen.has(`seq:${payload.seq}`)) return;
-          seen.add(`seq:${payload.seq}`);
+        hasSeq = 'event' in payload && typeof (payload as RunEventEnvelope).seq === 'number';
+        if (hasSeq) {
+          const seq = (payload as RunEventEnvelope).seq;
+          if (seen.has(`seq:${seq}`)) return;
+          seen.add(`seq:${seq}`);
         }
       } catch { return; }
-      if (seen.has(eventKey(e))) return;
-      seen.add(eventKey(e));
+      if (!hasSeq) {
+        if (seen.has(eventKey(e))) return;
+        seen.add(eventKey(e));
+      }
       if (e.type === 'done') {
         done = true;
         es.close();

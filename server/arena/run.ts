@@ -22,27 +22,37 @@ import { saveRun } from './store.ts';
 export class Semaphore {
   private waiters: (() => void)[] = [];
   constructor(private free: number) {}
-  async acquire(signal?: AbortSignal): Promise<boolean> {
+  async acquire(signal?: AbortSignal, deadlineMs?: number): Promise<boolean> {
+    if (deadlineMs != null && Date.now() >= deadlineMs) return false;
     if (this.free > 0) {
       this.free--;
       return true;
     }
     return new Promise<boolean>((resolve) => {
       let settled = false;
-      const onAbort = () => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (value: boolean) => {
         if (settled) return;
         settled = true;
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        resolve(value);
+      };
+      const onAbort = () => {
         const i = this.waiters.indexOf(grant);
         if (i >= 0) this.waiters.splice(i, 1);
-        resolve(false);
+        finish(false);
+      };
+      const onTimeout = () => {
+        const i = this.waiters.indexOf(grant);
+        if (i >= 0) this.waiters.splice(i, 1);
+        finish(false);
       };
       const grant = () => {
-        if (settled) return;
-        settled = true;
-        signal?.removeEventListener('abort', onAbort);
-        resolve(true);
+        finish(true);
       };
       this.waiters.push(grant);
+      if (deadlineMs != null) timer = setTimeout(onTimeout, Math.max(0, deadlineMs - Date.now()));
       if (signal?.aborted) onAbort();
       else signal?.addEventListener('abort', onAbort, { once: true });
     });
@@ -77,7 +87,8 @@ export function positiveIntEnv(value: string | undefined, fallback: number, max 
   return Number.isInteger(n) && n >= 1 ? Math.min(n, max) : fallback;
 }
 
-export const globalSessions = new Semaphore(positiveIntEnv(process.env.MAX_ACTIVE_SESSIONS, 16));
+export const MAX_ACTIVE_SESSIONS = positiveIntEnv(process.env.MAX_ACTIVE_SESSIONS, 16);
+export const globalSessions = new Semaphore(MAX_ACTIVE_SESSIONS);
 
 /** 同一密钥 + 同一主机共享的请求并发上限（键为哈希，内存中也不保存密钥原文） */
 const credentialLimiters = new Map<string, Semaphore>();
@@ -142,9 +153,24 @@ class StopSignal extends Error {}
  * canonical state 和 recent recap 取代。每个回合形态为：state → assistant
  * → (tool) → state，拼接时后续回合复用前一回合的 state 边界。
  */
-function compactTurns(turns: Turn[], maxRounds: number, maxChars: number): { turns: Turn[]; droppedRounds: number } {
+function clipReplayText(value: string, max: number): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(0, max - 40))}\n…（上下文预算截断）…`;
+}
+
+function shrinkTurn(turn: Turn): Turn {
+  // canonical state 和结构化 tool result 不能被字符串截断；超出预算时让
+  // 调用层确定性失败，而不是把协议 JSON 或状态面数据剪坏。
+  if (turn.role !== 'assistant') return turn;
+  return { ...turn, text: clipReplayText(turn.text, 2000), raw: turn.raw };
+}
+
+function compactTurns(turns: Turn[], maxRounds: number, maxChars: number): { turns: Turn[]; droppedRounds: number; overflow: boolean } {
   const assistants = turns.map((t, i) => (t.role === 'assistant' ? i : -1)).filter((i) => i >= 0);
-  if (!assistants.length) return { turns: turns.slice(-1), droppedRounds: 0 };
+  if (!assistants.length) {
+    const only = turns.slice(-1).map(shrinkTurn);
+    return { turns: only, droppedRounds: 0, overflow: JSON.stringify(only).length > maxChars };
+  }
   const rounds: Turn[][] = assistants.map((index, i) => {
     const start = i === 0 ? 0 : Math.max(0, index - 1);
     const end = i + 1 < assistants.length ? assistants[i + 1] - 1 : turns.length - 1;
@@ -157,7 +183,8 @@ function compactTurns(turns: Turn[], maxRounds: number, maxChars: number): { tur
     count--;
     candidate = build(count);
   }
-  return { turns: candidate, droppedRounds: rounds.length - count };
+  if (JSON.stringify(candidate).length > maxChars) candidate = candidate.map(shrinkTurn);
+  return { turns: candidate, droppedRounds: rounds.length - count, overflow: JSON.stringify(candidate).length > maxChars };
 }
 
 function sanitizeReplayRaw(value: unknown): unknown {
@@ -165,7 +192,11 @@ function sanitizeReplayRaw(value: unknown): unknown {
   if (!value || typeof value !== 'object') return value;
   const out: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    out[key] = key === 'plan' && typeof child === 'string' ? child.trim().slice(0, MAX_PLAN_CHARS) : sanitizeReplayRaw(child);
+    if (key === 'plan' && typeof child === 'string') out[key] = child.trim().slice(0, MAX_PLAN_CHARS);
+    else if (key === 'arguments' && typeof child === 'string') {
+      try { out[key] = JSON.stringify(sanitizeReplayRaw(JSON.parse(child))); }
+      catch { out[key] = child; }
+    } else out[key] = sanitizeReplayRaw(child);
   }
   return out;
 }
@@ -301,7 +332,7 @@ export class Contestant {
 
   private async acquireSlot(slot: Semaphore): Promise<boolean> {
     for (;;) {
-      const ok = await slot.acquire(this.abort.signal);
+      const ok = await slot.acquire(this.abort.signal, this.run.startedAt + this.run.limits.maxDurationSec * 1000);
       if (!ok) return false;
       if (!this.paused) return true;
       slot.release();
@@ -312,7 +343,7 @@ export class Contestant {
   private async acquireCredential(slot: Semaphore): Promise<boolean> {
     for (;;) {
       this.clockStop();
-      const ok = await slot.acquire(this.abort.signal);
+      const ok = await slot.acquire(this.abort.signal, this.run.startedAt + this.run.limits.maxDurationSec * 1000);
       this.clockStart();
       if (!ok) return false;
       if (this.paused) {
@@ -414,6 +445,24 @@ export class Contestant {
     };
   }
 
+  private rejectParallelToolCall(count: number): { content: string; moves: string[]; ok: boolean; error: string; plan: null; planProvided: boolean } {
+    const s = describeState(this.state);
+    const message = `单次 assistant 响应包含 ${count} 个工具调用；为避免基于旧状态串行执行，本轮未执行任何调用`;
+    return {
+      content: JSON.stringify({
+        ok: false,
+        solved: isSolved(this.state),
+        applied_moves: [],
+        executed: [],
+        moves_used: this.stats.moves,
+        correct_stickers: `${s.correct}/${s.total}`,
+        state: { encoding: s.encoding, size: s.size, net: s.net, faces: s.faces, state_hash: s.hash, move_count: this.stats.moves },
+        error: { code: 'PARALLEL_TOOL_CALLS_UNSUPPORTED', message, retryable: true },
+      }),
+      moves: [], ok: false, error: message, plan: null, planProvided: false,
+    };
+  }
+
   /** 当前 canonical state 是事实来源；每轮追加最新状态与原始协议块。 */
   private stateTurn(memory: TurnMemory): Turn {
     return { role: 'user', text: turnMessage(this.state, { ...memory, movesUsed: this.stats.moves }) };
@@ -439,7 +488,7 @@ export class Contestant {
     }
     const runAcquired = await this.acquireSlot(this.run.slots);
     if (!runAcquired) {
-      this.setStatus('stopped', this.failReason ?? '排队时被停止');
+      this.setStatus(this.queueExpired() ? 'failed' : 'stopped', this.queueExpired() ? `排队等待超过最大运行时间（${this.run.limits.maxDurationSec} 秒）` : (this.failReason ?? '排队时被停止'));
       this.config = undefined;
       this.apiKey = undefined;
       return;
@@ -454,7 +503,7 @@ export class Contestant {
     const globalAcquired = await this.acquireSlot(globalSessions);
     if (!globalAcquired) {
       this.run.slots.release();
-      this.setStatus('stopped', this.failReason ?? '排队时被停止');
+      this.setStatus(this.queueExpired() ? 'failed' : 'stopped', this.queueExpired() ? `排队等待超过最大运行时间（${this.run.limits.maxDurationSec} 秒）` : (this.failReason ?? '排队时被停止'));
       this.config = undefined;
       this.apiKey = undefined;
       return;
@@ -479,6 +528,7 @@ export class Contestant {
 
   private async loop() {
     const { limits } = this.run;
+    const deadline = this.run.startedAt + limits.maxDurationSec * 1000;
     this.setStatus('running');
     const config = this.config!;
     const apiKey = this.apiKey;
@@ -522,20 +572,23 @@ export class Contestant {
     try {
       for (;;) {
         await this.checkpoint();
-        const remainingMs = limits.maxDurationSec * 1000 - this.elapsed();
+        const remainingMs = deadline - Date.now();
         if (this.stats.apiCalls >= limits.maxApiCalls) return this.setStatus('failed', `达到最大 API 调用次数（${limits.maxApiCalls}）`);
         if (remainingMs <= 0) return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
         let result;
         let attempt = 0;
         for (;;) {
           await this.checkpoint();
-          const requestRemainingMs = limits.maxDurationSec * 1000 - this.elapsed();
+          const requestRemainingMs = deadline - Date.now();
           if (this.stats.apiCalls >= limits.maxApiCalls) return this.setStatus('failed', `达到最大 API 调用次数（${limits.maxApiCalls}）`);
           if (requestRemainingMs <= 0) return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
           // 等待同一密钥的并发名额时暂停计时：这是供应商的容量限制，不算模型用时
           if (limiter) {
             const ok = await this.acquireCredential(limiter);
-            if (!ok) throw new StopSignal();
+            if (!ok) {
+              if (this.queueExpired()) return this.setStatus('failed', `等待并发名额时超过最大运行时间（${limits.maxDurationSec} 秒）`);
+              throw new StopSignal();
+            }
           }
           this.stats.apiCalls++;
           // 请求发出前立即同步计数，前端可在模型思考期间显示当前调用次数。
@@ -543,19 +596,24 @@ export class Contestant {
           const started = Date.now();
           const toolChoice = forceTool && canForceTool ? 'required' : 'auto';
           try {
-            const compacted = compactTurns(turns, limits.maxHistoryRounds, limits.maxContextChars);
+            const fixedContextChars = JSON.stringify({ system, tools }).length;
+            const conversationBudget = limits.maxContextChars - fixedContextChars;
+            if (conversationBudget <= 0) return this.setStatus('failed', `系统提示和工具定义已超过上下文预算（${limits.maxContextChars} 字符）`);
+            const compacted = compactTurns(turns, limits.maxHistoryRounds, conversationBudget);
+            turns = compacted.turns;
             if (compacted.droppedRounds > 0) {
-              turns = compacted.turns;
               if (!historyCompactionLogged) {
                 this.log('info', `已压缩 ${compacted.droppedRounds} 个较早协议回合，保留最近 ${limits.maxHistoryRounds} 轮和最新 canonical state`);
                 historyCompactionLogged = true;
               }
             }
+            if (compacted.overflow) return this.setStatus('failed', `最新协议回合超过上下文预算（${limits.maxContextChars} 字符）`);
             result = await adapter.call({
               config, model: this.model, reasoningEffort: this.effort, maxOutputTokens: this.maxOutputTokens,
               endpoint, apiKey, system, tools, turns,
               toolChoice, signal: this.abort.signal,
               timeoutMs: Math.min(requestRemainingMs, limits.requestTimeoutSec * 1000),
+              deadlineMs: deadline,
             });
             if (result.forcedToolSupported === false) canForceTool = false;
             this.stats.lastLatencyMs = Date.now() - started;
@@ -567,7 +625,7 @@ export class Contestant {
             if (this.abort.signal.aborted) throw new StopSignal();
             const err = e instanceof ProviderError ? e : new ProviderError('network', '请求失败');
             this.recordCall(null, [], { error: err.message });
-            if (limits.maxDurationSec * 1000 - this.elapsed() <= 0) return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
+            if (deadline - Date.now() <= 0) return this.setStatus('failed', `达到最大运行时间（${limits.maxDurationSec} 秒）`);
             // 模型不支持某个可选参数：去掉该参数重试，并明确记录（不计入预算）
             const rejected = rejectedOptionalParam(err, { effort: this.effort !== 'default', forcedTool: toolChoice === 'required' });
             if (rejected) {
@@ -599,7 +657,7 @@ export class Contestant {
               const backoff = Math.min(30_000, 2000 * 2 ** (attempt - 1)) * (0.75 + Math.random() * 0.5);
               const delay = Math.round(err.retryAfterMs ?? backoff);
               this.log('warn', `${err.message}，${(delay / 1000).toFixed(1)} 秒后重试（第 ${attempt}/${maxAttempts} 次）`);
-              const waitMs = Math.min(delay, Math.max(0, limits.maxDurationSec * 1000 - this.elapsed()));
+              const waitMs = Math.min(delay, Math.max(0, deadline - Date.now()));
               await abortableDelay(waitMs, this.abort.signal);
               await this.checkpoint();
               continue;
@@ -637,7 +695,16 @@ export class Contestant {
         const toolResults: { callId: string; name: string; content: string }[] = [];
         let newPlan: string | undefined;
         let planSeen = false;
-        for (const call of result.toolCalls) {
+        const calls = result.toolCalls.length > 1 ? result.toolCalls.map(() => null) : result.toolCalls;
+        for (const call of calls) {
+          if (!call) {
+            const r = this.rejectParallelToolCall(result.toolCalls.length);
+            this.stats.invalidToolCalls++;
+            this.stats.toolCalls++;
+            summaries.push({ moves: [], ok: false, error: r.error });
+            toolResults.push({ callId: result.toolCalls[summaries.length - 1].id, name: result.toolCalls[summaries.length - 1].name || 'rotate_cube', content: r.content });
+            continue;
+          }
           this.stats.toolCalls++;
           // 必须回复每一个工具调用；复原后或达到上限时，剩余调用不再执行
           const blocked = isSolved(this.state) ? '魔方已复原，未执行' : null;

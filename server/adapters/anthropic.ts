@@ -1,5 +1,5 @@
 import { authHeaders, postJson, ProviderError } from './http.ts';
-import { reportedCost, THINKING_BUDGET, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
+import { contextTimeout, normalizeToolCallId, normalizeToolName, reportedCost, THINKING_BUDGET, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
 
 /** Anthropic Messages API（tool_use / tool_result） */
 function toMessages(turns: Turn[]) {
@@ -40,26 +40,32 @@ export const anthropicAdapter: ProtocolAdapter = {
     if (ctx.tools.length) {
       body.tools = ctx.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }));
       // 开启思考时 Anthropic 只允许 tool_choice=auto
-      body.tool_choice = { type: ctx.toolChoice === 'required' && !body.thinking ? 'any' : 'auto' };
+      body.tool_choice = { type: ctx.toolChoice === 'required' && !body.thinking ? 'any' : 'auto', disable_parallel_tool_use: true };
     }
 
     const { json } = await postJson(
       ctx.endpoint,
       { ...authHeaders(config.authMode, ctx.apiKey), 'anthropic-version': '2023-06-01' },
       body,
-      { signal: ctx.signal, timeoutMs: ctx.timeoutMs, secrets: [ctx.apiKey] },
+      { signal: ctx.signal, timeoutMs: contextTimeout(ctx), secrets: [ctx.apiKey] },
     );
     if (!Array.isArray(json?.content)) throw new ProviderError('parse', '响应中缺少 content 数组（该地址可能不是 Anthropic 协议）');
     const toolCalls: ToolCall[] = [];
+    const normalizedContent: any[] = [];
     let text = '';
     const thoughts: string[] = [];
     for (const b of json.content) {
       if (b.type === 'tool_use') {
         const ok = b.input && typeof b.input === 'object' && !Array.isArray(b.input);
-        toolCalls.push({ id: String(b.id), name: String(b.name), args: ok ? b.input : null, argsError: ok ? undefined : '工具参数不是 JSON 对象' });
-      } else if (b.type === 'text') text += b.text ?? '';
+        const name = normalizeToolName(b.name);
+        if (!name) continue;
+        const id = normalizeToolCallId(b.id, `anthropic_call_${toolCalls.length}`);
+        normalizedContent.push({ ...b, id, name, input: ok ? b.input : {} });
+        toolCalls.push({ id, name, args: ok ? b.input : null, argsError: ok ? undefined : '工具参数不是 JSON 对象' });
+      } else if (b.type === 'text') { normalizedContent.push(b); text += b.text ?? ''; }
       // redacted_thinking 只有密文，不展示
-      else if (b.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.trim()) thoughts.push(b.thinking.trim());
+      else if (b.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.trim()) { normalizedContent.push(b); thoughts.push(b.thinking.trim()); }
+      else if (b.type === 'redacted_thinking') normalizedContent.push(b);
     }
     const u = json.usage;
     const input = u
@@ -72,7 +78,7 @@ export const anthropicAdapter: ProtocolAdapter = {
       text,
       reasoning: thoughts.join('\n\n'),
       toolCalls,
-      raw: json.content,
+      raw: normalizedContent,
       finishReason: json.stop_reason ?? null,
       truncated: json.stop_reason === 'max_tokens',
       forcedToolSupported: !body.thinking,

@@ -1,5 +1,5 @@
 import { authHeaders, postJson, ProviderError } from './http.ts';
-import { parseArgs, reportedCost, splitThinkTags, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
+import { contextTimeout, normalizeArguments, normalizeToolCallId, normalizeToolName, parseArgs, reportedCost, splitThinkTags, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
 
 /** OpenAI 兼容 Chat Completions（tools / tool_calls / role=tool） */
 function toMessages(system: string, turns: Turn[]) {
@@ -45,7 +45,7 @@ export const openaiChatAdapter: ProtocolAdapter = {
     if (ctx.maxOutputTokens) body[completionTokensModels.has(modelKey) ? 'max_completion_tokens' : 'max_tokens'] = ctx.maxOutputTokens;
 
     const send = (b: Record<string, unknown>) =>
-      postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), b, { signal: ctx.signal, timeoutMs: ctx.timeoutMs, secrets: [ctx.apiKey] });
+      postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), b, { signal: ctx.signal, timeoutMs: contextTimeout(ctx), secrets: [ctx.apiKey] });
     let json;
     try {
       ({ json } = await send(body));
@@ -59,12 +59,17 @@ export const openaiChatAdapter: ProtocolAdapter = {
     if (!choice?.message) throw new ProviderError('parse', '响应中缺少 choices[0].message');
     const message = choice.message;
     const normalizedCalls = (Array.isArray(message.tool_calls) ? message.tool_calls : [])
-      .filter((c: any) => c?.function?.name)
-      .map((c: any, i: number) => ({
-        ...c,
-        id: String(c.id || `call_${Date.now()}_${i}`),
-        type: c.type ?? 'function',
-      }));
+      .map((c: any, i: number) => {
+        const name = normalizeToolName(c?.function?.name);
+        if (!name) return null;
+        return {
+          ...c,
+          id: normalizeToolCallId(c?.id, `chat_call_${i}`),
+          type: c.type ?? 'function',
+          function: { ...c.function, name, arguments: normalizeArguments(c?.function?.arguments) },
+        };
+      })
+      .filter(Boolean) as any[];
     const toolCalls: ToolCall[] = normalizedCalls.map((c: any) => ({
       id: c.id,
       name: String(c.function.name),

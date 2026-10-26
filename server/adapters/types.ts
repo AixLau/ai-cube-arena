@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { ProviderConfig, ReasoningEffort } from '../../shared/types.ts';
 
 /** 协议无关的工具定义（JSON Schema 仅使用各家都支持的子集） */
@@ -61,6 +62,8 @@ export interface CallContext {
   signal: AbortSignal;
   /** null 表示不限制单次请求时长，由整局限制或手动停止控制 */
   timeoutMs: number | null;
+  /** 本次运行的绝对截止时间；adapter 内部 fallback 共享同一 deadline。 */
+  deadlineMs?: number;
 }
 
 export interface ProtocolAdapter {
@@ -77,6 +80,26 @@ export function parseArgs(raw: unknown): { args: Record<string, unknown> | null;
   } catch {
     return { args: null, argsError: '工具参数不是合法 JSON' };
   }
+}
+
+export function normalizeToolCallId(raw: unknown, prefix: string): string {
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : `${prefix}_${randomUUID()}`;
+}
+
+export function normalizeToolName(raw: unknown): string | null {
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+}
+
+/** 将 provider 可能返回的 object arguments 规范化为协议回放所需的 JSON 字符串。 */
+export function normalizeArguments(raw: unknown): string {
+  if (typeof raw === 'string') return raw;
+  try { return JSON.stringify(raw ?? {}); } catch { return '{}'; }
+}
+
+export function contextTimeout(ctx: Pick<CallContext, 'timeoutMs' | 'deadlineMs'>): number | null {
+  const remaining = ctx.deadlineMs == null ? null : Math.max(1, ctx.deadlineMs - Date.now());
+  if (remaining === null) return ctx.timeoutMs;
+  return ctx.timeoutMs == null ? remaining : Math.min(ctx.timeoutMs, remaining);
 }
 
 /** 部分模型（如经中转的 R1 类模型）把思考写在正文的 <think>…</think> 中：拆出思考，正文只保留回答；未闭合视为被截断的思考 */

@@ -1,5 +1,5 @@
 import { authHeaders, postJson, ProviderError } from './http.ts';
-import { reportedCost, THINKING_BUDGET, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
+import { contextTimeout, normalizeArguments, normalizeToolCallId, normalizeToolName, parseArgs, reportedCost, THINKING_BUDGET, usageNum, type ProtocolAdapter, type ToolCall, type Turn } from './types.ts';
 
 /** Gemini 的 function declaration 使用受限 Schema 子集；去掉通用 JSON Schema 专属字段。 */
 export function normalizeGeminiTool(tool: { name: string; description: string; parameters: Record<string, unknown> }) {
@@ -33,12 +33,20 @@ function toContents(turns: Turn[]) {
       push(
         'user',
         t.results.map((r) => ({
-          functionResponse: { ...(r.callId.startsWith('gem_') ? {} : { id: r.callId }), name: r.name, response: { result: r.content } },
+          functionResponse: { id: r.callId, name: r.name, response: parseToolResult(r.content) },
         })),
       );
     }
   }
   return contents;
+}
+
+function parseToolResult(content: string): Record<string, unknown> {
+  try {
+    const value = JSON.parse(content);
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
+  } catch { /* fallback below */ }
+  return { result: content };
 }
 
 export const geminiAdapter: ProtocolAdapter = {
@@ -60,7 +68,7 @@ export const geminiAdapter: ProtocolAdapter = {
 
     const { json } = await postJson(ctx.endpoint, authHeaders(config.authMode, ctx.apiKey), body, {
       signal: ctx.signal,
-      timeoutMs: ctx.timeoutMs,
+      timeoutMs: contextTimeout(ctx),
       secrets: [ctx.apiKey],
     });
     const cand = json?.candidates?.[0];
@@ -69,6 +77,7 @@ export const geminiAdapter: ProtocolAdapter = {
       throw new ProviderError('parse', reason ? `请求被拦截：${reason}` : '响应中缺少 candidates（该地址可能不是 Gemini 协议）');
     }
     const parts: any[] = cand.content?.parts ?? [];
+    const normalizedParts: any[] = [];
     const toolCalls: ToolCall[] = [];
     let text = '';
     const thoughtTexts: string[] = [];
@@ -76,13 +85,19 @@ export const geminiAdapter: ProtocolAdapter = {
       if (p.functionCall) {
         const args = p.functionCall.args;
         const ok = !args || (typeof args === 'object' && !Array.isArray(args));
+        const name = normalizeToolName(p.functionCall.name);
+        if (!name) return;
+        const id = normalizeToolCallId(p.functionCall.id, `gemini_call_${i}`);
+        const parsedArgs = ok ? (args ?? {}) : parseArgs(normalizeArguments(args)).args;
+        normalizedParts.push({ ...p, functionCall: { ...p.functionCall, id, name, args: parsedArgs ?? {} } });
         toolCalls.push({
-          id: String(p.functionCall.id ?? `gem_${Date.now()}_${i}`),
-          name: String(p.functionCall.name),
-          args: ok ? (args ?? {}) : null,
+          id,
+          name,
+          args: ok ? parsedArgs : null,
           argsError: ok ? undefined : '工具参数不是 JSON 对象',
         });
       } else if (typeof p.text === 'string') {
+        normalizedParts.push(p);
         if (!p.thought) text += p.text;
         else if (p.text.trim()) thoughtTexts.push(p.text.trim());
       }
@@ -94,7 +109,7 @@ export const geminiAdapter: ProtocolAdapter = {
       text,
       reasoning: thoughtTexts.join('\n\n'),
       toolCalls,
-      raw: parts,
+      raw: normalizedParts,
       finishReason: cand.finishReason ?? null,
       truncated: cand.finishReason === 'MAX_TOKENS',
       // Gemini 的思考 Token 单独计数且按输出计费：输出 = candidates + thoughts，推理 = thoughts

@@ -14,7 +14,7 @@ const { assertAllowedUrl, isBlockedIp, safeLookup } = await import('./security/u
 const { redact } = await import('./security/redact.ts');
 const { normalizeProvider, refreshProvider } = await import('./providers/store.ts');
 const { testConnection } = await import('./providers/test.ts');
-const { Run, abortableDelay, positiveIntEnv, runs } = await import('./arena/run.ts');
+const { MAX_ACTIVE_SESSIONS, Run, abortableDelay, positiveIntEnv, runs } = await import('./arena/run.ts');
 const { DIFFICULTIES, DEFAULT_LIMITS } = await import('../shared/types.ts');
 const { invertAlg, formatAlg, parseAlg, applyMoves, solvedState } = await import('../shared/cube.ts');
 const { rotateCubeTool, systemPrompt, turnMessage } = await import('./arena/prompt.ts');
@@ -103,6 +103,21 @@ const server = http.createServer((req, res) => {
           },
         }],
       });
+    }
+    if (url.startsWith('/parallel/') && url.endsWith('/chat/completions')) {
+      const callNo = mock.calls.filter((c) => c.path === url).length;
+      const toolCalls = callNo === 1
+        ? [
+            { id: `parallel_a_${callNo}`, type: 'function', function: { name: 'rotate_cube', arguments: JSON.stringify({ moves: ['R'] }) } },
+            { id: `parallel_b_${callNo}`, type: 'function', function: { name: 'rotate_cube', arguments: JSON.stringify({ moves: ['U'] }) } },
+          ]
+        : [{ id: `parallel_ok_${callNo}`, type: 'function', function: { name: 'rotate_cube', arguments: JSON.stringify({ moves }) } }];
+      return json(200, { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null, tool_calls: toolCalls } }] });
+    }
+    if (url.startsWith('/objectargs/') && url.endsWith('/chat/completions')) {
+      const callNo = mock.calls.filter((c) => c.path === url).length;
+      const args = { moves: callNo === 1 ? moves.slice(0, 1) : moves.slice(1) };
+      return json(200, { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null, tool_calls: [{ id: `object_args_${callNo}`, type: 'function', function: { name: 'rotate_cube', arguments: args } }] } }] });
     }
     if (url.startsWith('/notoolloop/') && url.endsWith('/chat/completions')) {
       return json(200, { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: '我还在思考' } }] });
@@ -363,6 +378,7 @@ test('HTTP 供应商接口：移除旧存储接口，环境变量不预置，每
     assert.equal((await post('/api/providers', draft({}))).status, 404);
     assert.equal((await post('/api/providers/legacy/duplicate', {})).status, 404);
     const meta = await (await fetch(`${origin}/api/meta`)).json() as Record<string, unknown>;
+    assert.equal(meta.maxActiveSessions, MAX_ACTIVE_SESSIONS);
     assert.ok(!('encryptionAvailable' in meta));
     assert.ok(!JSON.stringify(meta).includes('server-secret'));
 
@@ -771,6 +787,9 @@ test('四种协议：二轮以上回放保留工具关联、provider metadata �
   assert.equal(gemini.length, 2);
   assert.ok(gemini[1].body.contents.some((content: any) => content.role === 'model' && content.parts.some((p: any) => p.functionCall)));
   assert.ok(gemini[1].body.contents.some((content: any) => content.role === 'user' && content.parts.some((p: any) => p.functionResponse)));
+  const geminiResponse = gemini[1].body.contents.flatMap((content: any) => content.parts).find((part: any) => part.functionResponse);
+  assert.equal(typeof geminiResponse.functionResponse.response, 'object');
+  assert.equal(typeof geminiResponse.functionResponse.response.ok, 'boolean');
 });
 
 test('Responses API：旧中转拒绝可选推理字段时回退到基础请求', async () => {
@@ -823,6 +842,39 @@ test('运行预算：达到 API 调用上限和连续无工具上限时失败', 
   assert.equal(durationRun.contestants[0].status, 'failed');
   assert.match(durationRun.contestants[0].failReason ?? '', /最大运行时间/);
   mock.delayMs = 0;
+});
+
+test('多工具响应：拒绝基于同一旧状态的并行调用后允许模型恢复', async () => {
+  const cfg = await makeProvider({ name: 'parallel', baseUrl: `${base}/parallel/v1` });
+  mock.calls = [];
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  assert.equal(run.contestants[0].status, 'solved');
+  assert.equal(run.contestants[0].snapshot().stats.moves, mock.solution.length);
+  const calls = mock.calls.filter((c) => c.path.startsWith('/parallel/'));
+  assert.ok(calls[1].body.messages.some((m: any) => m.role === 'tool' && /PARALLEL_TOOL_CALLS_UNSUPPORTED/.test(m.content)));
+});
+
+test('arguments 规范化：Chat adapter 将 object arguments 转成 JSON 字符串后回放', async () => {
+  const cfg = await makeProvider({ name: 'objectargs', baseUrl: `${base}/objectargs/v1` });
+  mock.calls = [];
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS });
+  mock.solution = formatAlg(invertAlg(run.scramble)).split(' ');
+  await run.start();
+  assert.equal(run.contestants[0].status, 'solved');
+  const calls = mock.calls.filter((c) => c.path.startsWith('/objectargs/'));
+  assert.equal(typeof calls[1].body.messages.find((m: any) => m.role === 'assistant').tool_calls[0].function.arguments, 'string');
+});
+
+test('上下文硬预算：系统与工具定义已占满预算时不发送超预算请求', async () => {
+  const cfg = await makeProvider({ name: 'context-budget', baseUrl: `${base}/context-budget/v1` });
+  mock.calls = [];
+  const run = new Run([E(cfg)], D3, { ...DEFAULT_LIMITS, maxContextChars: 100 });
+  await run.start();
+  assert.equal(run.contestants[0].status, 'failed');
+  assert.match(run.contestants[0].failReason ?? '', /上下文预算/);
+  assert.equal(mock.calls.filter((c) => c.path.startsWith('/context-budget/')).length, 0);
 });
 
 test('看门狗：canonical state 连续不变时按无进展预算确定性失败', async () => {
